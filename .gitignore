@@ -23,3 +23,5 @@ teleop/data/
 episode_0*
 .vscode/
 *.pkl
+# LiveKit Portal credentials (portal mode)
+teleop/.env
