@@ -5,18 +5,18 @@ runs with --portal:
 
   * IK arm joint targets and dex3 hand retargeting targets are published
     as Portal actions (operator role) at the teleop control rate.
-  * Robot state (j0..j13 = dual arm q) is received via on_observation and
-    fed back into the IK as warm start; if no robot state arrives the
-    bridge dead-reckons with the last sent targets.
-  * Video frames (declared in portal.yaml, currently head_camera) are
-    received via the same observation stream and exposed through an
-    ImageClient-compatible API (get_head_frame() -> .bgr) so that
-    render_to_xr() and recording keep working unchanged.
+  * Robot state (named G1-EDU arm joints, or legacy j0..j13) is received
+    via on_observation and fed back into the IK as warm start; if no
+    robot state arrives the bridge dead-reckons with the last sent targets.
+  * Video: every track listed under portal.yaml `videos:` is subscribed.
+    TeleVuer / get_head_frame() shows the first entry; extra tracks map
+    to left/right wrist in declaration order. No track-name aliases.
 
 No unitree_sdk2py import happens anywhere in this module.
 """
 from __future__ import annotations
 
+import copy
 import os
 import sys
 import time
@@ -38,7 +38,29 @@ if parent2_dir not in sys.path:
 # Number of f32 joint fields per part in the portal action schema.
 PORTAL_ARM_DOF = 7    # per arm (G1_29 / H1_2 style)
 PORTAL_HAND_DOF = 7   # per hand (dex3-1)
-PORTAL_STATE_ARM_FIELDS = 14  # j0..j13 map to left (0..6) / right (7..13) arm
+PORTAL_STATE_ARM_FIELDS = 14  # left (0..6) / right (7..13) arm q
+
+# G1-EDU named joints (portal.yaml) ↔ 7+7 arm / 7+7 dex3 vectors.
+_LEFT_ARM = (
+    "L_SHOULDER_PITCH", "L_SHOULDER_ROLL", "L_SHOULDER_YAW", "L_ELBOW",
+    "L_WRIST_ROLL", "L_WRIST_PITCH", "L_WRIST_YAW",
+)
+_RIGHT_ARM = (
+    "R_SHOULDER_PITCH", "R_SHOULDER_ROLL", "R_SHOULDER_YAW", "R_ELBOW",
+    "R_WRIST_ROLL", "R_WRIST_PITCH", "R_WRIST_YAW",
+)
+_LEFT_HAND = (
+    "left_thumb_mcp", "left_thumb_aux", "left_thumb_pip",
+    "left_index_mcp", "left_index_pip", "left_middle_mcp", "left_middle_pip",
+)
+_RIGHT_HAND = (
+    "right_thumb_mcp", "right_thumb_aux", "right_thumb_pip",
+    "right_index_mcp", "right_index_pip", "right_middle_mcp", "right_middle_pip",
+)
+
+# ImageClient / TeleVuer slot names (teleop_hand_and_arm.py). Portal tracks
+# bind to these by yaml order, not by track name.
+_TELEVUER_SLOTS = ("head_camera", "left_wrist_camera", "right_wrist_camera")
 
 
 class _Frame:
@@ -177,14 +199,31 @@ class PortalTeleopBridge:
         with open(portal_yaml, "r") as f:
             self._wire = yaml.safe_load(f)
         self._declared_videos = [v["name"] for v in (self._wire.get("videos") or [])]
+        self._xr_track = self._declared_videos[0] if self._declared_videos else None
 
         self._cam_config_path = cam_config_path or os.path.join(
             parent_dir, "utils", "portal_cam_config.yaml")
+
+        with open(self._cam_config_path, "r") as f:
+            self._cam_config_raw = yaml.safe_load(f) or {}
+        self._expected_hw = {}
+        for cam, cfg_cam in self._cam_config_raw.items():
+            if not isinstance(cfg_cam, dict):
+                continue
+            shape = cfg_cam.get("image_shape")
+            if isinstance(shape, (list, tuple)) and len(shape) >= 2:
+                self._expected_hw[cam] = (int(shape[0]), int(shape[1]))
 
         cfg = OperatorConfig.from_yaml_file(portal_yaml, self._room)
         self._op = Operator(cfg)
         self._op.on_observation(self._on_observation)
         self._op.on_drop(lambda drops: logger_mp.debug(f"[portal] dropped states: {len(drops)}"))
+        # Firehose: TeleVuer must keep getting frames even when state/video
+        # observation matching drops (reuse_stale_frames is false).
+        for track in self._declared_videos:
+            self._op.on_video_frame(track, self._on_video_frame)
+        self._action_fields = [f["name"] for f in (self._wire.get("action") or [])]
+        self._frames_logged = set()
 
         # --- caches guarded by locks ------------------------------------
         self._obs_lock = threading.Lock()
@@ -252,7 +291,8 @@ class PortalTeleopBridge:
         await claim_active_operator(self._op)
         self._connected_evt.set()
         logger_mp.info(f"[portal] connected as '{self._op.local_identity()}'; "
-                       f"active operator claimed. videos={self._declared_videos}")
+                       f"active operator claimed. videos={self._declared_videos} "
+                       f"televuer={self._xr_track!r}")
         while not self._stop_evt.is_set():
             await asyncio.sleep(0.05)
         logger_mp.info("[portal] disconnecting operator ...")
@@ -272,30 +312,16 @@ class PortalTeleopBridge:
     def _on_observation(self, obs) -> None:
         ts_us = getattr(obs, "timestamp_us", None)
         wall = time.time()
-        q_new = None
-        state = getattr(obs, "state", None) or {}
-        vals = []
-        for k in range(PORTAL_STATE_ARM_FIELDS):
-            v = state.get(f"j{k}")
-            if v is None:
-                vals = None
-                break
-            vals.append(float(v))
-        if vals is not None:
-            q_new = np.array(vals, dtype=np.float64)
+        raw = getattr(obs, "raw_state", None)
+        if not raw:
+            raw = getattr(obs, "state", None) or {}
+        q_new = self._arm_q_from_state(raw)
 
         frames = {}
         for name, frame in (getattr(obs, "frames", None) or {}).items():
-            try:
-                data = frame.data
-                w, h = frame.width, frame.height
-                if data is None or not w or not h:
-                    continue
-                rgb = np.frombuffer(bytes(data), dtype=np.uint8).reshape(int(h), int(w), 3)
-                frames[name] = _Frame(np.ascontiguousarray(rgb[:, :, ::-1]),  # RGB -> BGR
-                                      getattr(frame, "timestamp_us", 0))
-            except Exception as exc:
-                logger_mp.warning(f"[portal] failed to decode frame '{name}': {exc}")
+            stored = self._decode_video_frame(name, frame)
+            if stored:
+                frames.update(stored)
 
         with self._obs_lock:
             self._obs_ts_us = ts_us
@@ -311,6 +337,59 @@ class PortalTeleopBridge:
                 self._state_q = q_new
                 self._state_ts_wall = wall
             self._frames.update(frames)
+
+    def _on_video_frame(self, track: str, frame) -> None:
+        stored = self._decode_video_frame(track, frame)
+        if not stored:
+            return
+        with self._obs_lock:
+            self._frames.update(stored)
+
+    def _arm_q_from_state(self, raw: dict):
+        """14-DoF arm q from named G1-EDU joints or legacy j0..j13."""
+        if not raw:
+            return None
+        named = [raw.get(n) for n in _LEFT_ARM + _RIGHT_ARM]
+        if all(v is not None for v in named):
+            return np.array([float(v) for v in named], dtype=np.float64)
+        legacy = [raw.get(f"j{k}") for k in range(PORTAL_STATE_ARM_FIELDS)]
+        if all(v is not None for v in legacy):
+            return np.array([float(v) for v in legacy], dtype=np.float64)
+        return None
+
+    def _slot_for_track(self, track: str) -> str | None:
+        try:
+            idx = self._declared_videos.index(track)
+        except ValueError:
+            return None
+        if idx >= len(_TELEVUER_SLOTS):
+            return None
+        return _TELEVUER_SLOTS[idx]
+
+    def _decode_video_frame(self, track: str, frame) -> dict:
+        """RGB24 Portal frame → BGR _Frame, keyed by the yaml track name."""
+        try:
+            data = frame.data
+            w, h = int(frame.width), int(frame.height)
+            if data is None or not w or not h:
+                return {}
+            rgb = np.frombuffer(bytes(data), dtype=np.uint8).reshape(h, w, 3)
+            bgr = np.ascontiguousarray(rgb[:, :, ::-1])
+            slot = self._slot_for_track(track)
+            if slot and slot in self._expected_hw:
+                eh, ew = self._expected_hw[slot]
+                if (h, w) != (eh, ew):
+                    import cv2
+                    bgr = cv2.resize(bgr, (ew, eh), interpolation=cv2.INTER_LINEAR)
+            wrapped = _Frame(bgr, getattr(frame, "timestamp_us", 0) or 0)
+            if track not in self._frames_logged:
+                self._frames_logged.add(track)
+                dest = "TeleVuer" if track == self._xr_track else (slot or "record")
+                logger_mp.info(f"[portal] video '{track}' {w}x{h} → {dest}")
+            return {track: wrapped}
+        except Exception as exc:
+            logger_mp.warning(f"[portal] failed to decode frame '{track}': {exc}")
+            return {}
 
     # ------------------------------------------------------------------
     # outbound actions (arm controller API)
@@ -332,13 +411,7 @@ class PortalTeleopBridge:
             fsm_id = self._fsm_id
         with self._obs_lock:
             in_reply_to = self._obs_ts_us
-        values = {"fsm_id": int(fsm_id)}
-        for i in range(PORTAL_ARM_DOF):
-            values[f"left_arm_q{i}"] = float(q14[i])
-            values[f"right_arm_q{i}"] = float(q14[PORTAL_ARM_DOF + i])
-        for i in range(PORTAL_HAND_DOF):
-            values[f"left_hand_q{i}"] = float(hand_q[i])
-            values[f"right_hand_q{i}"] = float(hand_q[PORTAL_HAND_DOF + i])
+        values = self._action_values(q14, hand_q, fsm_id)
         try:
             self._op.send_action(values,
                                  timestamp_us=int(time.time() * 1_000_000),
@@ -348,6 +421,34 @@ class PortalTeleopBridge:
             return
         with self._arm_lock:
             self._last_sent_q[:] = q14
+
+    def _action_values(self, q14: np.ndarray, hand_q: np.ndarray, fsm_id: int) -> dict:
+        """Fill every declared action field (G1-EDU names or legacy q indices)."""
+        values = {}
+        for name in self._action_fields:
+            if name == "fsm_id":
+                values[name] = int(fsm_id)
+            elif name in ("vx", "vy", "vyaw"):
+                values[name] = 0.0
+            elif name in _LEFT_ARM:
+                values[name] = float(q14[_LEFT_ARM.index(name)])
+            elif name in _RIGHT_ARM:
+                values[name] = float(q14[PORTAL_ARM_DOF + _RIGHT_ARM.index(name)])
+            elif name in _LEFT_HAND:
+                values[name] = float(hand_q[_LEFT_HAND.index(name)])
+            elif name in _RIGHT_HAND:
+                values[name] = float(hand_q[PORTAL_HAND_DOF + _RIGHT_HAND.index(name)])
+            elif name.startswith("left_arm_q"):
+                values[name] = float(q14[int(name[len("left_arm_q"):])])
+            elif name.startswith("right_arm_q"):
+                values[name] = float(q14[PORTAL_ARM_DOF + int(name[len("right_arm_q"):])])
+            elif name.startswith("left_hand_q"):
+                values[name] = float(hand_q[int(name[len("left_hand_q"):])])
+            elif name.startswith("right_hand_q"):
+                values[name] = float(hand_q[PORTAL_HAND_DOF + int(name[len("right_hand_q"):])])
+            else:
+                values[name] = 0.0
+        return values
 
     def set_fsm_id(self, fsm_id: int) -> None:
         with self._hand_lock:
@@ -448,34 +549,53 @@ class PortalTeleopBridge:
     # ImageClient-compatible video API
     # ------------------------------------------------------------------
     def get_cam_config(self) -> dict:
-        """Load the static camera config and gate it on the portal.yaml
-        video tracks. Portal carries the video, so teleimager-WebRTC is
-        always disabled in portal mode (render_to_xr is used instead)."""
-        with open(self._cam_config_path, "r") as f:
-            cam_config = yaml.safe_load(f)
-        for cam, track in (("head_camera", "head_camera"),
-                           ("left_wrist_camera", "left_wrist_camera"),
-                           ("right_wrist_camera", "right_wrist_camera")):
-            if cam not in cam_config:
+        """TeleVuer still reads ImageClient keys (head_camera, …). Bind
+        portal.yaml `videos:` to those slots in declaration order. WebRTC
+        stays off; first yaml track enables head_camera ZMQ for render_to_xr.
+        """
+        cam_config = copy.deepcopy(self._cam_config_raw)
+        for slot in _TELEVUER_SLOTS:
+            if slot not in cam_config:
                 continue
-            active = cam_config[cam].get("enable_zmq", False) and track in self._declared_videos
-            cam_config[cam]["enable_zmq"] = active
-            cam_config[cam]["enable_webrtc"] = False
+            cam_config[slot]["enable_webrtc"] = False
+            cam_config[slot]["enable_zmq"] = False
+        for i, track in enumerate(self._declared_videos):
+            if i >= len(_TELEVUER_SLOTS):
+                logger_mp.warning(f"[portal] ignoring extra video track '{track}'")
+                continue
+            slot = _TELEVUER_SLOTS[i]
+            if slot not in cam_config:
+                cam_config[slot] = {
+                    "enable_zmq": True,
+                    "enable_webrtc": False,
+                    "binocular": False,
+                    "image_shape": [480, 640],
+                    "fps": 30,
+                    "webrtc_port": 60001 + i,
+                }
+            else:
+                cam_config[slot]["enable_zmq"] = True
+                cam_config[slot]["enable_webrtc"] = False
+            logger_mp.info(f"[portal] yaml video[{i}] '{track}' → {slot}")
         return cam_config
 
-    def _get_frame(self, track: str):
+    def _get_frame_at(self, index: int):
+        if index >= len(self._declared_videos):
+            return _Frame(None)
+        track = self._declared_videos[index]
         with self._obs_lock:
             frame = self._frames.get(track)
             return frame if frame is not None else _Frame(None)
 
     def get_head_frame(self):
-        return self._get_frame("head_camera")
+        """First portal.yaml `videos:` track (what TeleVuer renders)."""
+        return self._get_frame_at(0)
 
     def get_left_wrist_frame(self):
-        return self._get_frame("left_wrist_camera")
+        return self._get_frame_at(1)
 
     def get_right_wrist_frame(self):
-        return self._get_frame("right_wrist_camera")
+        return self._get_frame_at(2)
 
     # ------------------------------------------------------------------
     def close(self) -> None:

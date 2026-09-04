@@ -5,7 +5,9 @@
 head_camera:
   # camera config
 
-  # if enable_zmq and enable_webrtc are both false, the camera will not start
+  # if enable_zmq and enable_webrtc are both false, TeleVuer will not start
+  # in immersive mode. Portal mode: first portal.yaml `videos:` track uses
+  # this block (image_shape / binocular) for render_to_xr; enable_webrtc is forced off.
   # Set to true to enable ZMQ publishing, false to disable
   enable_zmq: true
   # Port to publish camera stream, e.g. zmq tcp://*:55555.  image_client.py should connect to the same port

@@ -1,82 +1,94 @@
-# Shared Portal wire contract for xr_teleoperate (operator) and the robot
-# gateway / mock robot. Video tracks, state and action schemas are all
-# declared here — operator and robot both load this file, so adding a
-# track or field later requires no code change.
-#
-# Identity & secrets stay in .env (gitignored); the room name comes from
-# LIVEKIT_ROOM and is passed as `session` to *Config.from_yaml_file().
+# Portal wire contract for Unitree G1-EDU (29 DoF body + Dex3 hands).
+# Secrets stay in .env; room name comes from LIVEKIT_ROOM.
 version: 1
 fps: 30
 slack: 10
-# 4.0 ticks ≈ 133 ms sync window: WebRTC H264 decode on the 2-vCPU VM adds
-# ~100 ms video latency, which exceeded the default 2.0 (≈67 ms) window and
-# caused heavy state drops.
 tolerance: 4.0
 state_reliable: true
 action_reliable: true
 reuse_stale_frames: false
 ping_ms: 1000
-
 videos:
-  # Single head camera for now. Add wrist cameras back later by appending
-  # tracks here — the operator bridge enables them automatically.
-  - { name: head_camera, codec: h264, screencast: false, max_bitrate_kbps: 8000 }
-
-# Robot → Operator: G1 body joints (j0..j13 = left/right arm, 7 each)
-# plus remainder (j14..j19) and the FSM id.
+  # First track is shown in TeleVuer. Name must match the robot publisher.
+  - { name: head_camera, codec: h264, screencast: false, max_bitrate_kbps: 2000 }
 state:
-  - { name: j0, dtype: f32 }
-  - { name: j1, dtype: f32 }
-  - { name: j2, dtype: f32 }
-  - { name: j3, dtype: f32 }
-  - { name: j4, dtype: f32 }
-  - { name: j5, dtype: f32 }
-  - { name: j6, dtype: f32 }
-  - { name: j7, dtype: f32 }
-  - { name: j8, dtype: f32 }
-  - { name: j9, dtype: f32 }
-  - { name: j10, dtype: f32 }
-  - { name: j11, dtype: f32 }
-  - { name: j12, dtype: f32 }
-  - { name: j13, dtype: f32 }
-  - { name: j14, dtype: f32 }
-  - { name: j15, dtype: f32 }
-  - { name: j16, dtype: f32 }
-  - { name: j17, dtype: f32 }
-  - { name: j18, dtype: f32 }
-  - { name: j19, dtype: f32 }
+  # body ids 0–28, q in rad
+  - { name: L_LEG_HIP_PITCH, dtype: f32 }
+  - { name: L_LEG_HIP_ROLL, dtype: f32 }
+  - { name: L_LEG_HIP_YAW, dtype: f32 }
+  - { name: L_LEG_KNEE, dtype: f32 }
+  - { name: L_LEG_ANKLE_PITCH, dtype: f32 }
+  - { name: L_LEG_ANKLE_ROLL, dtype: f32 }
+  - { name: R_LEG_HIP_PITCH, dtype: f32 }
+  - { name: R_LEG_HIP_ROLL, dtype: f32 }
+  - { name: R_LEG_HIP_YAW, dtype: f32 }
+  - { name: R_LEG_KNEE, dtype: f32 }
+  - { name: R_LEG_ANKLE_PITCH, dtype: f32 }
+  - { name: R_LEG_ANKLE_ROLL, dtype: f32 }
+  - { name: WAIST_YAW, dtype: f32 }
+  - { name: WAIST_ROLL, dtype: f32 }
+  - { name: WAIST_PITCH, dtype: f32 }
+  - { name: L_SHOULDER_PITCH, dtype: f32 }
+  - { name: L_SHOULDER_ROLL, dtype: f32 }
+  - { name: L_SHOULDER_YAW, dtype: f32 }
+  - { name: L_ELBOW, dtype: f32 }
+  - { name: L_WRIST_ROLL, dtype: f32 }
+  - { name: L_WRIST_PITCH, dtype: f32 }
+  - { name: L_WRIST_YAW, dtype: f32 }
+  - { name: R_SHOULDER_PITCH, dtype: f32 }
+  - { name: R_SHOULDER_ROLL, dtype: f32 }
+  - { name: R_SHOULDER_YAW, dtype: f32 }
+  - { name: R_ELBOW, dtype: f32 }
+  - { name: R_WRIST_ROLL, dtype: f32 }
+  - { name: R_WRIST_PITCH, dtype: f32 }
+  - { name: R_WRIST_YAW, dtype: f32 }
+  # Dex3, 7 DoF per hand
+  - { name: left_thumb_mcp, dtype: f32 }
+  - { name: left_thumb_aux, dtype: f32 }
+  - { name: left_thumb_pip, dtype: f32 }
+  - { name: left_index_mcp, dtype: f32 }
+  - { name: left_index_pip, dtype: f32 }
+  - { name: left_middle_mcp, dtype: f32 }
+  - { name: left_middle_pip, dtype: f32 }
+  - { name: right_thumb_mcp, dtype: f32 }
+  - { name: right_thumb_aux, dtype: f32 }
+  - { name: right_thumb_pip, dtype: f32 }
+  - { name: right_index_mcp, dtype: f32 }
+  - { name: right_index_pip, dtype: f32 }
+  - { name: right_middle_mcp, dtype: f32 }
+  - { name: right_middle_pip, dtype: f32 }
   - { name: fsm_id, dtype: i32 }
-
-# Operator → Robot: arm joint position targets (rad, IK solution) and
-# dex3 hand joint position targets (rad, retargeting solution), plus the
-# pass-through FSM id.
 action:
+  # Gateway-Teleop / FSM; in v1 nur empfangen, nicht ausführen
   - { name: fsm_id, dtype: i32 }
-  - { name: left_arm_q0, dtype: f32 }
-  - { name: left_arm_q1, dtype: f32 }
-  - { name: left_arm_q2, dtype: f32 }
-  - { name: left_arm_q3, dtype: f32 }
-  - { name: left_arm_q4, dtype: f32 }
-  - { name: left_arm_q5, dtype: f32 }
-  - { name: left_arm_q6, dtype: f32 }
-  - { name: right_arm_q0, dtype: f32 }
-  - { name: right_arm_q1, dtype: f32 }
-  - { name: right_arm_q2, dtype: f32 }
-  - { name: right_arm_q3, dtype: f32 }
-  - { name: right_arm_q4, dtype: f32 }
-  - { name: right_arm_q5, dtype: f32 }
-  - { name: right_arm_q6, dtype: f32 }
-  - { name: left_hand_q0, dtype: f32 }
-  - { name: left_hand_q1, dtype: f32 }
-  - { name: left_hand_q2, dtype: f32 }
-  - { name: left_hand_q3, dtype: f32 }
-  - { name: left_hand_q4, dtype: f32 }
-  - { name: left_hand_q5, dtype: f32 }
-  - { name: left_hand_q6, dtype: f32 }
-  - { name: right_hand_q0, dtype: f32 }
-  - { name: right_hand_q1, dtype: f32 }
-  - { name: right_hand_q2, dtype: f32 }
-  - { name: right_hand_q3, dtype: f32 }
-  - { name: right_hand_q4, dtype: f32 }
-  - { name: right_hand_q5, dtype: f32 }
-  - { name: right_hand_q6, dtype: f32 }
+  - { name: vx, dtype: f32 }
+  - { name: vy, dtype: f32 }
+  - { name: vyaw, dtype: f32 }
+  - { name: L_SHOULDER_PITCH, dtype: f32 }
+  - { name: L_SHOULDER_ROLL, dtype: f32 }
+  - { name: L_SHOULDER_YAW, dtype: f32 }
+  - { name: L_ELBOW, dtype: f32 }
+  - { name: L_WRIST_ROLL, dtype: f32 }
+  - { name: L_WRIST_PITCH, dtype: f32 }
+  - { name: L_WRIST_YAW, dtype: f32 }
+  - { name: R_SHOULDER_PITCH, dtype: f32 }
+  - { name: R_SHOULDER_ROLL, dtype: f32 }
+  - { name: R_SHOULDER_YAW, dtype: f32 }
+  - { name: R_ELBOW, dtype: f32 }
+  - { name: R_WRIST_ROLL, dtype: f32 }
+  - { name: R_WRIST_PITCH, dtype: f32 }
+  - { name: R_WRIST_YAW, dtype: f32 }
+  - { name: left_thumb_mcp, dtype: f32 }
+  - { name: left_thumb_aux, dtype: f32 }
+  - { name: left_thumb_pip, dtype: f32 }
+  - { name: left_index_mcp, dtype: f32 }
+  - { name: left_index_pip, dtype: f32 }
+  - { name: left_middle_mcp, dtype: f32 }
+  - { name: left_middle_pip, dtype: f32 }
+  - { name: right_thumb_mcp, dtype: f32 }
+  - { name: right_thumb_aux, dtype: f32 }
+  - { name: right_thumb_pip, dtype: f32 }
+  - { name: right_index_mcp, dtype: f32 }
+  - { name: right_index_pip, dtype: f32 }
+  - { name: right_middle_mcp, dtype: f32 }
+  - { name: right_middle_pip, dtype: f32 }
