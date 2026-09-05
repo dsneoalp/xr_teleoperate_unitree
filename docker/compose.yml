@@ -1,12 +1,13 @@
 # Operator on the server, robot/mock on host network so LIVEKIT_URL=ws://127.0.0.1:7880 works.
-# Build:  docker compose build mock operator robot
-# Mock:   docker compose up mock
-# Operator (TTY for [r]/[q]): docker compose run --rm -it operator
+# From repo root:
+#   docker compose -f docker/compose.yml build mock operator robot
+#   docker compose -f docker/compose.yml up mock
+#   docker compose -f docker/compose.yml run --rm -it operator
 
 name: xr-teleop
 
 x-portal-build: &portal-build
-  context: .
+  context: ..
   dockerfile: docker/Dockerfile
   additional_contexts:
     portalpkg: /home/neoalp/portal/python/packages/livekit-portal
@@ -20,7 +21,7 @@ services:
     image: xr-teleop:mock
     network_mode: host
     env_file:
-      - teleop/.env
+      - ../teleop/.env
     environment:
       PYTHONUNBUFFERED: "1"
     stdin_open: true
@@ -34,7 +35,7 @@ services:
     image: xr-teleop:robot
     network_mode: host
     env_file:
-      - teleop/.env
+      - ../teleop/.env
     environment:
       PYTHONUNBUFFERED: "1"
     stdin_open: true
@@ -48,7 +49,7 @@ services:
     image: xr-teleop:operator
     network_mode: host
     env_file:
-      - teleop/.env
+      - ../teleop/.env
     environment:
       PYTHONUNBUFFERED: "1"
     volumes:
