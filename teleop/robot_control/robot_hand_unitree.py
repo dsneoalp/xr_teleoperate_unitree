@@ -32,8 +32,9 @@ kTopicDex3RightState = "rt/dex3/right/state"
 
 
 class Dex3_1_Controller:
-    def __init__(self, left_hand_array_in, right_hand_array_in, dual_hand_data_lock = None, dual_hand_state_array_out = None,
-                       dual_hand_action_array_out = None, fps = 100.0, Unit_Test = False, simulation_mode = False, xr_motion_data_ready_in = None):
+    def __init__(self, left_hand_array_in=None, right_hand_array_in=None, dual_hand_data_lock = None, dual_hand_state_array_out = None,
+                       dual_hand_action_array_out = None, fps = 100.0, Unit_Test = False, simulation_mode = False, xr_motion_data_ready_in = None,
+                       apply_targets = False):
         """
         [note] A *_array type parameter requires using a multiprocessing Array, because it needs to be passed to the internal child process
 
@@ -58,10 +59,12 @@ class Dex3_1_Controller:
         self.fps = fps
         self.Unit_Test = Unit_Test
         self.simulation_mode = simulation_mode
-        if not self.Unit_Test:
-            self.hand_retargeting = HandRetargeting(HandType.UNITREE_DEX3)
-        else:
-            self.hand_retargeting = HandRetargeting(HandType.UNITREE_DEX3_Unit_Test)
+        self.apply_targets = apply_targets
+        if not apply_targets:
+            if not self.Unit_Test:
+                self.hand_retargeting = HandRetargeting(HandType.UNITREE_DEX3)
+            else:
+                self.hand_retargeting = HandRetargeting(HandType.UNITREE_DEX3_Unit_Test)
 
         # initialize handcmd publisher and handstate subscriber
         self.LeftHandCmb_publisher = ChannelPublisher(kTopicDex3LeftCommand, HandCmd_)
@@ -90,12 +93,43 @@ class Dex3_1_Controller:
             logger_mp.warning("[Dex3_1_Controller] Waiting to subscribe dds...")
         logger_mp.info("[Dex3_1_Controller] Subscribe dds ok.")
 
+        self._init_hand_cmd_msgs()
+        if apply_targets:
+            logger_mp.info("[Dex3_1_Controller] apply_targets mode (no XR retargeting).")
+            logger_mp.info("Initialize Dex3_1_Controller OK!")
+            return
+
         hand_control_process = Process(target=self.control_process, args=(left_hand_array_in, right_hand_array_in,  self.left_hand_state_array, self.right_hand_state_array,
                                                                           dual_hand_data_lock, dual_hand_state_array_out, dual_hand_action_array_out, xr_motion_data_ready_in))
         hand_control_process.daemon = True
         hand_control_process.start()
 
         logger_mp.info("Initialize Dex3_1_Controller OK!")
+
+    def _init_hand_cmd_msgs(self):
+        q = 0.0
+        dq = 0.0
+        tau = 0.0
+        kp = 1.5
+        kd = 0.2
+        self.left_msg = unitree_hg_msg_dds__HandCmd_()
+        for id in Dex3_1_Left_JointIndex:
+            ris_mode = self._RIS_Mode(id=id, status=0x01)
+            self.left_msg.motor_cmd[id].mode = ris_mode._mode_to_uint8()
+            self.left_msg.motor_cmd[id].q = q
+            self.left_msg.motor_cmd[id].dq = dq
+            self.left_msg.motor_cmd[id].tau = tau
+            self.left_msg.motor_cmd[id].kp = kp
+            self.left_msg.motor_cmd[id].kd = kd
+        self.right_msg = unitree_hg_msg_dds__HandCmd_()
+        for id in Dex3_1_Right_JointIndex:
+            ris_mode = self._RIS_Mode(id=id, status=0x01)
+            self.right_msg.motor_cmd[id].mode = ris_mode._mode_to_uint8()
+            self.right_msg.motor_cmd[id].q = q
+            self.right_msg.motor_cmd[id].dq = dq
+            self.right_msg.motor_cmd[id].tau = tau
+            self.right_msg.motor_cmd[id].kp = kp
+            self.right_msg.motor_cmd[id].kd = kd
 
     def _subscribe_hand_state(self):
         while True:
@@ -132,7 +166,12 @@ class Dex3_1_Controller:
 
         self.LeftHandCmb_publisher.Write(self.left_msg)
         self.RightHandCmb_publisher.Write(self.right_msg)
-        # logger_mp.debug("hand ctrl publish ok.")
+
+    def get_current_dual_hand_q(self):
+        return np.concatenate((
+            np.array(self.left_hand_state_array[:]),
+            np.array(self.right_hand_state_array[:]),
+        ))
     
     def control_process(self, left_hand_array_in, right_hand_array_in, left_hand_state_array, right_hand_state_array,
                               dual_hand_data_lock = None, dual_hand_state_array_out = None, dual_hand_action_array_out = None, xr_motion_data_ready_in = None):
@@ -140,36 +179,7 @@ class Dex3_1_Controller:
 
         left_q_target  = np.full(Dex3_Num_Motors, 0)
         right_q_target = np.full(Dex3_Num_Motors, 0)
-
-        q = 0.0
-        dq = 0.0
-        tau = 0.0
-        kp = 1.5
-        kd = 0.2
-
-        # initialize dex3-1's left hand cmd msg
-        self.left_msg  = unitree_hg_msg_dds__HandCmd_()
-        for id in Dex3_1_Left_JointIndex:
-            ris_mode = self._RIS_Mode(id = id, status = 0x01)
-            motor_mode = ris_mode._mode_to_uint8()
-            self.left_msg.motor_cmd[id].mode = motor_mode
-            self.left_msg.motor_cmd[id].q    = q
-            self.left_msg.motor_cmd[id].dq   = dq
-            self.left_msg.motor_cmd[id].tau  = tau
-            self.left_msg.motor_cmd[id].kp   = kp
-            self.left_msg.motor_cmd[id].kd   = kd
-
-        # initialize dex3-1's right hand cmd msg
-        self.right_msg = unitree_hg_msg_dds__HandCmd_()
-        for id in Dex3_1_Right_JointIndex:
-            ris_mode = self._RIS_Mode(id = id, status = 0x01)
-            motor_mode = ris_mode._mode_to_uint8()
-            self.right_msg.motor_cmd[id].mode = motor_mode  
-            self.right_msg.motor_cmd[id].q    = q
-            self.right_msg.motor_cmd[id].dq   = dq
-            self.right_msg.motor_cmd[id].tau  = tau
-            self.right_msg.motor_cmd[id].kp   = kp
-            self.right_msg.motor_cmd[id].kd   = kd  
+        self._init_hand_cmd_msgs()
 
         try:
             while self.running:

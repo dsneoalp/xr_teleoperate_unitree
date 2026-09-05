@@ -12,14 +12,12 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 
-from televuer import TeleVuerWrapper
+from televuer import TeleVuerWrapper 
 from teleop.robot_control.robot_arm_ik import G1_29_ArmIK, G1_23_ArmIK, H1_2_ArmIK, H1_ArmIK, H2_ArmIK, R1_A5_ArmIK, R1_A7_ArmIK
 from teleop.utils.episode_writer import EpisodeWriter
-from teleop.utils.ipc import IPC_Server
+from teleop.utils.ipc import IPC_Server 
 from sshkeyboard import listen_keyboard, stop_listening
 
-# NOTE: unitree_sdk2py / robot_arm / motion_switcher are imported lazily
-# inside __main__ so that --portal mode runs without the Unitree SDK.
 
 def publish_reset_category(category: int, publisher): # Scene Reset signal
     from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
@@ -90,14 +88,6 @@ if __name__ == '__main__':
     parser.add_argument('--task-goal', type = str, default = 'pick up cube.', help = 'task goal for recording at json file')
     parser.add_argument('--task-desc', type = str, default = 'task description', help = 'task description for recording at json file')
     parser.add_argument('--task-steps', type = str, default = 'step1: do this; step2: do that;', help = 'task steps for recording at json file')
-    # portal (LiveKit) mode
-    parser.add_argument('--portal', action='store_true', help='Transport actions/state/video over LiveKit Portal instead of Unitree DDS')
-    parser.add_argument('--portal-yaml', type=str, default=os.path.join(current_dir, 'portal.yaml'), help='Path to the shared portal wire contract (portal.yaml)')
-    parser.add_argument('--env-file', type=str, default=os.path.join(current_dir, '.env'), help='Path to the .env with LIVEKIT_URL / API_KEY / API_SECRET / ROOM')
-    parser.add_argument('--livekit-url', type=str, default=None, help='Override LIVEKIT_URL from the .env file')
-    parser.add_argument('--livekit-room', type=str, default=None, help='Override LIVEKIT_ROOM from the .env file')
-    parser.add_argument('--portal-identity', type=str, default='xr-teleop', help='LiveKit participant identity of the teleop operator')
-    parser.add_argument('--cam-config', type=str, default=os.path.join(current_dir, 'utils', 'portal_cam_config.yaml'), help='Static camera config used in portal mode (replaces teleimager cam config)')
 
     args = parser.parse_args()
     logger_mp.debug(f"args: {args}")
@@ -105,26 +95,18 @@ if __name__ == '__main__':
     if args.ee == "dex1_internal" and args.motion:
         parser.error("--ee dex1_internal does not currently support --motion.")
 
-    if args.portal:
-        if args.arm != "G1_29":
-            parser.error("--portal currently only supports --arm G1_29 (7 DoF per arm match the action schema).")
-        if args.ee not in (None, "dex3"):
-            parser.error("--portal currently only supports --ee dex3 (7 joint targets per hand match the action schema).")
-        if args.sim:
-            parser.error("--sim is not supported together with --portal.")
-        if args.motion:
-            parser.error("--motion is not supported together with --portal.")
-
     try:
-        # setup dds communication domains id (skipped in portal mode: no Unitree SDK involved)
-        if not args.portal:
-            from unitree_sdk2py.core.channel import ChannelFactoryInitialize # dds
-            if args.sim:
-                ChannelFactoryInitialize(1, networkInterface=args.network_interface)
-            else:
-                ChannelFactoryInitialize(0, networkInterface=args.network_interface)
+        from unitree_sdk2py.core.channel import ChannelFactoryInitialize # dds
+        if args.sim:
+            ChannelFactoryInitialize(1, networkInterface=args.network_interface)
+        else:
+            ChannelFactoryInitialize(0, networkInterface=args.network_interface)
+        from teleop.robot_control.robot_arm import (
+            G1_29_ArmController, G1_29_Arm_Internal_Dex1_Controller,
+            G1_23_ArmController, H1_2_ArmController, H1_ArmController,
+            H2_ArmController, R1_A5_ArmController, R1_A7_ArmController,
+        )
 
-        # ipc communication mode. client usage: see utils/ipc.py
         if args.ipc:
             ipc_server = IPC_Server(on_press=on_press,get_state=get_state)
             ipc_server.start()
@@ -135,41 +117,14 @@ if __name__ == '__main__':
                                                       daemon=True)
             listen_keyboard_thread.start()
 
-        # image client (portal mode: bridge doubles as image client and arm/hand controller)
-        portal_bridge = None
         left_hand_pos_array = None
         right_hand_pos_array = None
         dual_hand_data_lock = None
         dual_hand_state_array = None
         dual_hand_action_array = None
-        if args.portal:
-            from teleop.robot_control.portal_operator import PortalTeleopBridge
-            if args.ee == "dex3":
-                left_hand_pos_array = Array('d', 75, lock = True)      # [input] XR left hand skeleton
-                right_hand_pos_array = Array('d', 75, lock = True)     # [input] XR right hand skeleton
-                dual_hand_data_lock = Lock()
-                dual_hand_state_array = Array('d', 14, lock = False)   # [output] left/right hand state(14)
-                dual_hand_action_array = Array('d', 14, lock = False)  # [output] left/right hand action(14)
-            portal_bridge = PortalTeleopBridge(portal_yaml=args.portal_yaml,
-                                                env_file=args.env_file,
-                                                identity=args.portal_identity,
-                                                room=args.livekit_room,
-                                                url=args.livekit_url,
-                                                ee=args.ee,
-                                                left_hand_array_in=left_hand_pos_array,
-                                                right_hand_array_in=right_hand_pos_array,
-                                                dual_hand_data_lock=dual_hand_data_lock,
-                                                dual_hand_state_array_out=dual_hand_state_array,
-                                                dual_hand_action_array_out=dual_hand_action_array,
-                                                xr_motion_data_ready_in=None,  # attached below once the Value exists
-                                                cam_config_path=args.cam_config)
-            img_client = portal_bridge
-            camera_config = portal_bridge.get_cam_config()
-            portal_bridge.wait_until_connected()  # fail fast if LiveKit is unreachable
-        else:
-            from teleimager.image_client import ImageClient
-            img_client = ImageClient(host=args.img_server_ip, request_bgr=True)
-            camera_config = img_client.get_cam_config()
+        from teleimager.image_client import ImageClient
+        img_client = ImageClient(host=args.img_server_ip, request_bgr=True)
+        camera_config = img_client.get_cam_config()
         logger_mp.debug(f"Camera config: {camera_config}")
         xr_need_local_img = not (args.display_mode == 'pass-through' or camera_config['head_camera']['enable_webrtc'])
 
@@ -186,21 +141,18 @@ if __name__ == '__main__':
                                      webrtc_url=f"https://{args.img_server_ip}:{camera_config['head_camera']['webrtc_port']}/offer",
                                      arm_reference_mode="head_yaw"
                                      )
-        
-        # motion mode (G1: Regular mode R1+X, not Running mode R2+A) — DDS only, skipped in portal mode
-        if not args.portal:
-            from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper
-            if args.motion:
-                if args.input_mode == "controller":
-                    loco_wrapper = LocoClientWrapper()
-            else:
-                motion_switcher = MotionSwitcher()
-                status, result = motion_switcher.Enter_Debug_Mode()
-                logger_mp.info(f"Enter debug mode: {'Success' if status == 0 else 'Failed'}")
+        from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper
+        if args.motion:
+            if args.input_mode == "controller":
+                loco_wrapper = LocoClientWrapper()
+        else:
+            motion_switcher = MotionSwitcher()
+            status, result = motion_switcher.Enter_Debug_Mode()
+            logger_mp.info(f"Enter debug mode: {'Success' if status == 0 else 'Failed'}")
 
+
+        ## Shared Boolean Value ###
         xr_motion_data_ready = Value('b', False, lock=True)        # [input] whether XR hand/controller motion data has arrived
-        if portal_bridge is not None:
-            portal_bridge.set_xr_motion_data_ready(xr_motion_data_ready)
 
         if args.ee == "dex1_internal":
             if args.arm != "G1_29":
@@ -211,11 +163,7 @@ if __name__ == '__main__':
             dual_gripper_state_array = Array('d', 2, lock=False)   # current left, right gripper state(2) data.
             dual_gripper_action_array = Array('d', 2, lock=False)  # current left, right gripper action(2) data.
 
-        # arm
-        if args.portal:
-            arm_ik = G1_29_ArmIK()
-            arm_ctrl = portal_bridge  # actions/state via LiveKit Portal, no Unitree SDK
-        elif args.arm == "G1_29":
+        if args.arm == "G1_29":
             arm_ik = G1_29_ArmIK()
             if args.ee == "dex1_internal":
                 arm_ctrl = G1_29_Arm_Internal_Dex1_Controller(left_gripper_value, right_gripper_value, dual_gripper_data_lock, dual_gripper_state_array,
@@ -240,12 +188,9 @@ if __name__ == '__main__':
         elif args.arm == "R1_A7":
             arm_ik = R1_A7_ArmIK()
             arm_ctrl = R1_A7_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
-
         # end-effector
         if args.ee in ("dex3", "inspire_ftp", "inspire_dfx") and args.input_mode == "controller":
             raise ValueError(f"{args.ee} does not support controller input mode.")
-        elif args.portal:
-            pass  # dex3 hand targets are computed by the portal bridge's local retargeting thread
         elif args.ee == "dex3":
             from teleop.robot_control.robot_hand_unitree import Dex3_1_Controller
             left_hand_pos_array = Array('d', 75, lock = True)      # [input]
@@ -302,7 +247,7 @@ if __name__ == '__main__':
                                                 dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim, xr_motion_data_ready_in=xr_motion_data_ready)
         else:
             pass
-        
+        ### Robot Control ###
         # simulation mode
         if args.sim:
             from unitree_sdk2py.core.channel import ChannelPublisher
@@ -312,6 +257,9 @@ if __name__ == '__main__':
             from teleop.utils.sim_state_topic import start_sim_state_subscribe
             sim_state_subscriber = start_sim_state_subscribe()
 
+
+        ## Operator Control ###
+        # recoder should be on operator side.
         # record + headless / non-headless mode
         if args.record:
             recorder = EpisodeWriter(task_dir = os.path.join(args.task_dir, args.task_name),

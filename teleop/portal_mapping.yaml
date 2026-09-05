@@ -1,0 +1,37 @@
+# Teleop binding: portal.yaml field names → controller vectors.
+# List order is the index in sol_q / ctrl_dual_arm / Dex3 / loco.
+# Every name must exist in portal.yaml (action; joints also in state).
+fsm: fsm_id
+loco: [vx, vy, vyaw]
+left_arm:
+  - L_SHOULDER_PITCH
+  - L_SHOULDER_ROLL
+  - L_SHOULDER_YAW
+  - L_ELBOW
+  - L_WRIST_ROLL
+  - L_WRIST_PITCH
+  - L_WRIST_YAW
+right_arm:
+  - R_SHOULDER_PITCH
+  - R_SHOULDER_ROLL
+  - R_SHOULDER_YAW
+  - R_ELBOW
+  - R_WRIST_ROLL
+  - R_WRIST_PITCH
+  - R_WRIST_YAW
+left_hand:
+  - left_thumb_mcp
+  - left_thumb_aux
+  - left_thumb_pip
+  - left_index_mcp
+  - left_index_pip
+  - left_middle_mcp
+  - left_middle_pip
+right_hand:
+  - right_thumb_mcp
+  - right_thumb_aux
+  - right_thumb_pip
+  - right_index_mcp
+  - right_index_pip
+  - right_middle_mcp
+  - right_middle_pip

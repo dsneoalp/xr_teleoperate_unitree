@@ -1,0 +1,12 @@
+.git
+**/.venv
+**/__pycache__
+**/*.pyc
+**/*.egg-info
+teleop/.env
+teleop/utils/data
+**/*.pkl
+**/.pytest_cache
+*.md
+README*
+CHANGELOG*

@@ -1,3 +1,5 @@
+# Dieser Service ließt die Befehle von der Tastatus um den Teleop Prozess zu steuern.
+
 import os
 import zmq
 import time

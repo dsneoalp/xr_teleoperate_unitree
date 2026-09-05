@@ -1,18 +1,18 @@
-"""LiveKit Portal based robot interface for xr_teleoperate.
+"""LiveKit Portal operator bridge for xr_teleoperate.
 
-Replaces the Unitree DDS arm/hand controllers when teleop_hand_and_arm.py
-runs with --portal:
+Used by teleop_operator.py (not as arm_ctrl):
 
-  * IK arm joint targets and dex3 hand retargeting targets are published
-    as Portal actions (operator role) at the teleop control rate.
-  * Robot state (named G1-EDU arm joints, or legacy j0..j13) is received
-    via on_observation and fed back into the IK as warm start; if no
-    robot state arrives the bridge dead-reckons with the last sent targets.
+  * IK arm targets, dex3 retargeting, and loco (vx/vy/vyaw) are published
+    as Portal actions at the teleop control rate.
+  * Robot state is received via on_observation; arm q feeds the IK warm
+    start, dq is estimated from Δq/Δt. Missing state dead-reckons with
+    the last sent targets.
   * Video: every track listed under portal.yaml `videos:` is subscribed.
     TeleVuer / get_head_frame() shows the first entry; extra tracks map
-    to left/right wrist in declaration order. No track-name aliases.
+    to left/right wrist in declaration order.
 
 No unitree_sdk2py import happens anywhere in this module.
+Joint names come from portal_mapping.yaml, not hardcoded tuples.
 """
 from __future__ import annotations
 
@@ -35,31 +35,9 @@ parent2_dir = os.path.dirname(parent_dir)                          # repo root
 if parent2_dir not in sys.path:
     sys.path.append(parent2_dir)
 
-# Number of f32 joint fields per part in the portal action schema.
-PORTAL_ARM_DOF = 7    # per arm (G1_29 / H1_2 style)
-PORTAL_HAND_DOF = 7   # per hand (dex3-1)
-PORTAL_STATE_ARM_FIELDS = 14  # left (0..6) / right (7..13) arm q
+from teleop.robot_control.portal_mapping import PortalMapping
 
-# G1-EDU named joints (portal.yaml) ↔ 7+7 arm / 7+7 dex3 vectors.
-_LEFT_ARM = (
-    "L_SHOULDER_PITCH", "L_SHOULDER_ROLL", "L_SHOULDER_YAW", "L_ELBOW",
-    "L_WRIST_ROLL", "L_WRIST_PITCH", "L_WRIST_YAW",
-)
-_RIGHT_ARM = (
-    "R_SHOULDER_PITCH", "R_SHOULDER_ROLL", "R_SHOULDER_YAW", "R_ELBOW",
-    "R_WRIST_ROLL", "R_WRIST_PITCH", "R_WRIST_YAW",
-)
-_LEFT_HAND = (
-    "left_thumb_mcp", "left_thumb_aux", "left_thumb_pip",
-    "left_index_mcp", "left_index_pip", "left_middle_mcp", "left_middle_pip",
-)
-_RIGHT_HAND = (
-    "right_thumb_mcp", "right_thumb_aux", "right_thumb_pip",
-    "right_index_mcp", "right_index_pip", "right_middle_mcp", "right_middle_pip",
-)
-
-# ImageClient / TeleVuer slot names (teleop_hand_and_arm.py). Portal tracks
-# bind to these by yaml order, not by track name.
+# ImageClient / TeleVuer slot names. Portal tracks bind by yaml order.
 _TELEVUER_SLOTS = ("head_camera", "left_wrist_camera", "right_wrist_camera")
 
 
@@ -86,13 +64,7 @@ def mint_portal_token(api_key: str, api_secret: str, identity: str, room: str,
                       ttl_hours: int = 6,
                       min_playout_delay_ms: int = 0,
                       max_playout_delay_ms: int = 1) -> str:
-    """Mint a LiveKit JWT for a portal participant (Robot or Operator).
-
-    Mirrors the upstream examples' mint_token: the portal roles self-set the
-    `lk.portal.role` attribute on connect, which requires
-    can_update_own_metadata; the RoomConfiguration with tight playout-delay
-    bounds (0..1 ms) minimizes video latency for teleop.
-    """
+    """Mint a LiveKit JWT for a portal participant (Robot or Operator)."""
     import datetime
     from livekit import api
     from livekit.protocol.room import RoomConfiguration
@@ -137,26 +109,10 @@ async def claim_active_operator(op, identity: str | None = None,
 
 
 class PortalTeleopBridge:
-    """Drop-in replacement for the Unitree arm/hand controllers that
-    transports actions, state and video over LiveKit Portal.
+    """Operator-side LiveKit transport for teleop_operator.py.
 
-    Exposes the subset of the G1_29_ArmController / ImageClient interfaces
-    used by teleop_hand_and_arm.py:
-
-      Arm controller side:
-        ctrl_dual_arm(q_target, tauff_target)
-        ctrl_dual_arm_go_home()
-        get_current_dual_arm_q() / get_current_dual_arm_dq()
-        set_arm_velocity_limit(limit)
-
-      Image client side:
-        get_cam_config()
-        get_head_frame() / get_left_wrist_frame() / get_right_wrist_frame()
-        close()
-
-    Dex3 hand retargeting runs in its own thread (same math as
-    Dex3_1_Controller.control_process, minus the DDS publishing) and the
-    resulting joint targets are appended to every outgoing action.
+    Call as `teleop_bridge` (not `arm_ctrl`). Sends actions via
+    `send_targets`; exposes ImageClient-style video getters.
     """
 
     def __init__(self,
@@ -167,7 +123,6 @@ class PortalTeleopBridge:
                  url: str | None = None,
                  ee: str | None = None,
                  hand_fps: float = 100.0,
-                 # dex3 shared-memory wiring (same objects the DDS controller used)
                  left_hand_array_in=None,
                  right_hand_array_in=None,
                  dual_hand_data_lock=None,
@@ -175,6 +130,7 @@ class PortalTeleopBridge:
                  dual_hand_action_array_out=None,
                  xr_motion_data_ready_in=None,
                  cam_config_path: str | None = None,
+                 mapping_yaml: str | None = None,
                  state_timeout: float = 0.5):
         from livekit.portal import Operator, OperatorConfig
 
@@ -184,7 +140,6 @@ class PortalTeleopBridge:
         self._ee = ee
         self._state_timeout = state_timeout
 
-        # --- configuration ----------------------------------------------
         _load_dotenv(env_file)
         self._url = url or os.environ.get("LIVEKIT_URL")
         self._room = room or os.environ.get("LIVEKIT_ROOM", "g1-portal")
@@ -195,6 +150,11 @@ class PortalTeleopBridge:
                 "LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET missing "
                 f"(looked in env and {env_file})"
             )
+
+        mapping_yaml = mapping_yaml or os.path.join(parent_dir, "portal_mapping.yaml")
+        self._map = PortalMapping(mapping_yaml, portal_yaml)
+        logger_mp.info(f"[portal] mapping {mapping_yaml}: "
+                       f"arm_dof={self._map.arm_dof} hand_dof={self._map.hand_dof}")
 
         with open(portal_yaml, "r") as f:
             self._wire = yaml.safe_load(f)
@@ -218,45 +178,46 @@ class PortalTeleopBridge:
         self._op = Operator(cfg)
         self._op.on_observation(self._on_observation)
         self._op.on_drop(lambda drops: logger_mp.debug(f"[portal] dropped states: {len(drops)}"))
-        # Firehose: TeleVuer must keep getting frames even when state/video
-        # observation matching drops (reuse_stale_frames is false).
         for track in self._declared_videos:
             self._op.on_video_frame(track, self._on_video_frame)
-        self._action_fields = [f["name"] for f in (self._wire.get("action") or [])]
         self._frames_logged = set()
 
-        # --- caches guarded by locks ------------------------------------
+        arm_dof = self._map.arm_dof
+        hand_dof = self._map.hand_dof
+
         self._obs_lock = threading.Lock()
-        self._state_q = None            # np.array(14) from robot state
-        self._state_dq = np.zeros(PORTAL_STATE_ARM_FIELDS)
-        self._state_ts_wall = 0.0       # time.time() when last state arrived
+        self._state_q = None
+        self._state_dq = np.zeros(arm_dof)
+        self._state_ts_wall = 0.0
         self._prev_state_q = None
         self._prev_state_ts_us = None
-        self._obs_ts_us = None          # timestamp of last observation
-        self._frames = {}               # track name -> _Frame(bgr)
+        self._obs_ts_us = None
+        self._frames = {}
 
         self._arm_lock = threading.Lock()
-        self._q_target = np.zeros(2 * PORTAL_ARM_DOF)
-        self._last_sent_q = np.zeros(2 * PORTAL_ARM_DOF)
+        self._q_target = np.zeros(arm_dof)
+        self._last_sent_q = np.zeros(arm_dof)
 
         self._hand_lock = threading.Lock()
-        self._hand_q = np.zeros(2 * PORTAL_HAND_DOF)
+        self._hand_q = np.zeros(hand_dof)
         self._fsm_id = 0
+        self._vx = 0.0
+        self._vy = 0.0
+        self._vyaw = 0.0
 
-        # --- threads -----------------------------------------------------
         self._stop_evt = threading.Event()
         self._connected_evt = threading.Event()
         self._connect_error = None
         self._loop = None
 
         self._hand_thread = None
+        self._left_hand_array_in = left_hand_array_in
+        self._right_hand_array_in = right_hand_array_in
+        self._dual_hand_data_lock = dual_hand_data_lock
+        self._dual_hand_state_array_out = dual_hand_state_array_out
+        self._dual_hand_action_array_out = dual_hand_action_array_out
+        self._xr_motion_data_ready_in = xr_motion_data_ready_in
         if self._ee == "dex3" and left_hand_array_in is not None and right_hand_array_in is not None:
-            self._left_hand_array_in = left_hand_array_in
-            self._right_hand_array_in = right_hand_array_in
-            self._dual_hand_data_lock = dual_hand_data_lock
-            self._dual_hand_state_array_out = dual_hand_state_array_out
-            self._dual_hand_action_array_out = dual_hand_action_array_out
-            self._xr_motion_data_ready_in = xr_motion_data_ready_in
             self._hand_fps = hand_fps
             self._hand_thread = threading.Thread(target=self._hand_retarget_loop, daemon=True)
             self._hand_thread.start()
@@ -266,15 +227,12 @@ class PortalTeleopBridge:
 
         logger_mp.info(f"[portal] connecting operator '{identity}' to room '{self._room}' at {self._url} ...")
 
-    # ------------------------------------------------------------------
-    # portal asyncio plumbing
-    # ------------------------------------------------------------------
     def _portal_loop(self):
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
         try:
             self._loop.run_until_complete(self._async_main())
-        except Exception as exc:  # connection failures etc.
+        except Exception as exc:
             self._connect_error = exc
             logger_mp.error(f"[portal] operator loop terminated: {exc}")
         finally:
@@ -306,16 +264,14 @@ class PortalTeleopBridge:
             msg = self._connect_error or "timeout"
             raise RuntimeError(f"[portal] operator failed to connect: {msg}")
 
-    # ------------------------------------------------------------------
-    # inbound data
-    # ------------------------------------------------------------------
     def _on_observation(self, obs) -> None:
         ts_us = getattr(obs, "timestamp_us", None)
         wall = time.time()
         raw = getattr(obs, "raw_state", None)
         if not raw:
             raw = getattr(obs, "state", None) or {}
-        q_new = self._arm_q_from_state(raw)
+        q_new = self._map.unpack_arm_q(raw)
+        hand_new = self._map.unpack_hand_q(raw)
 
         frames = {}
         for name, frame in (getattr(obs, "frames", None) or {}).items():
@@ -338,24 +294,19 @@ class PortalTeleopBridge:
                 self._state_ts_wall = wall
             self._frames.update(frames)
 
+        if (hand_new is not None
+                and self._dual_hand_state_array_out is not None
+                and self._dual_hand_data_lock is not None):
+            with self._dual_hand_data_lock:
+                n = min(len(self._dual_hand_state_array_out), hand_new.size)
+                self._dual_hand_state_array_out[:n] = hand_new[:n]
+
     def _on_video_frame(self, track: str, frame) -> None:
         stored = self._decode_video_frame(track, frame)
         if not stored:
             return
         with self._obs_lock:
             self._frames.update(stored)
-
-    def _arm_q_from_state(self, raw: dict):
-        """14-DoF arm q from named G1-EDU joints or legacy j0..j13."""
-        if not raw:
-            return None
-        named = [raw.get(n) for n in _LEFT_ARM + _RIGHT_ARM]
-        if all(v is not None for v in named):
-            return np.array([float(v) for v in named], dtype=np.float64)
-        legacy = [raw.get(f"j{k}") for k in range(PORTAL_STATE_ARM_FIELDS)]
-        if all(v is not None for v in legacy):
-            return np.array([float(v) for v in legacy], dtype=np.float64)
-        return None
 
     def _slot_for_track(self, track: str) -> str | None:
         try:
@@ -367,7 +318,6 @@ class PortalTeleopBridge:
         return _TELEVUER_SLOTS[idx]
 
     def _decode_video_frame(self, track: str, frame) -> dict:
-        """RGB24 Portal frame → BGR _Frame, keyed by the yaml track name."""
         try:
             data = frame.data
             w, h = int(frame.width), int(frame.height)
@@ -391,27 +341,34 @@ class PortalTeleopBridge:
             logger_mp.warning(f"[portal] failed to decode frame '{track}': {exc}")
             return {}
 
-    # ------------------------------------------------------------------
-    # outbound actions (arm controller API)
-    # ------------------------------------------------------------------
-    def ctrl_dual_arm(self, q_target, tauff_target) -> None:
-        """Queue one action: arm targets from IK + latest hand targets."""
-        q = np.asarray(q_target, dtype=np.float64).copy()
+    def send_targets(self, arm_q, hand_q=None, vx=0.0, vy=0.0, vyaw=0.0, fsm_id=None) -> None:
+        """Publish one action: arm (+ optional hand) targets and loco."""
+        q = np.asarray(arm_q, dtype=np.float64).copy()
         with self._arm_lock:
             self._q_target[:] = q
+        with self._hand_lock:
+            if hand_q is not None:
+                self._hand_q[:] = np.asarray(hand_q, dtype=np.float64).reshape(-1)
+            self._vx = float(vx)
+            self._vy = float(vy)
+            self._vyaw = float(vyaw)
+            if fsm_id is not None:
+                self._fsm_id = int(fsm_id)
         if self._loop is not None and self._connected_evt.is_set():
             try:
                 self._loop.call_soon_threadsafe(self._send_action_now, q)
             except RuntimeError:
-                pass  # loop already closed during shutdown
+                pass
 
-    def _send_action_now(self, q14: np.ndarray) -> None:
+    def _send_action_now(self, q_arm: np.ndarray) -> None:
         with self._hand_lock:
             hand_q = self._hand_q.copy()
             fsm_id = self._fsm_id
+            vx, vy, vyaw = self._vx, self._vy, self._vyaw
         with self._obs_lock:
             in_reply_to = self._obs_ts_us
-        values = self._action_values(q14, hand_q, fsm_id)
+        values = self._map.pack_action(
+            arm_q=q_arm, hand_q=hand_q, vx=vx, vy=vy, vyaw=vyaw, fsm_id=fsm_id)
         try:
             self._op.send_action(values,
                                  timestamp_us=int(time.time() * 1_000_000),
@@ -420,48 +377,12 @@ class PortalTeleopBridge:
             logger_mp.warning(f"[portal] send_action failed: {exc}")
             return
         with self._arm_lock:
-            self._last_sent_q[:] = q14
-
-    def _action_values(self, q14: np.ndarray, hand_q: np.ndarray, fsm_id: int) -> dict:
-        """Fill every declared action field (G1-EDU names or legacy q indices)."""
-        values = {}
-        for name in self._action_fields:
-            if name == "fsm_id":
-                values[name] = int(fsm_id)
-            elif name in ("vx", "vy", "vyaw"):
-                values[name] = 0.0
-            elif name in _LEFT_ARM:
-                values[name] = float(q14[_LEFT_ARM.index(name)])
-            elif name in _RIGHT_ARM:
-                values[name] = float(q14[PORTAL_ARM_DOF + _RIGHT_ARM.index(name)])
-            elif name in _LEFT_HAND:
-                values[name] = float(hand_q[_LEFT_HAND.index(name)])
-            elif name in _RIGHT_HAND:
-                values[name] = float(hand_q[PORTAL_HAND_DOF + _RIGHT_HAND.index(name)])
-            elif name.startswith("left_arm_q"):
-                values[name] = float(q14[int(name[len("left_arm_q"):])])
-            elif name.startswith("right_arm_q"):
-                values[name] = float(q14[PORTAL_ARM_DOF + int(name[len("right_arm_q"):])])
-            elif name.startswith("left_hand_q"):
-                values[name] = float(hand_q[int(name[len("left_hand_q"):])])
-            elif name.startswith("right_hand_q"):
-                values[name] = float(hand_q[PORTAL_HAND_DOF + int(name[len("right_hand_q"):])])
-            else:
-                values[name] = 0.0
-        return values
+            self._last_sent_q[:] = q_arm
 
     def set_fsm_id(self, fsm_id: int) -> None:
         with self._hand_lock:
             self._fsm_id = int(fsm_id)
 
-    def set_arm_velocity_limit(self, velocity_limit: float = 30.0) -> None:
-        # Velocity clipping is the robot gateway's responsibility in portal
-        # mode; accepted for API compatibility only.
-        logger_mp.debug(f"[portal] set_arm_velocity_limit ignored ({velocity_limit})")
-
-    # ------------------------------------------------------------------
-    # state feedback for the IK
-    # ------------------------------------------------------------------
     def get_current_dual_arm_q(self) -> np.ndarray:
         with self._obs_lock:
             fresh = (time.time() - self._state_ts_wall) < self._state_timeout
@@ -475,11 +396,13 @@ class PortalTeleopBridge:
             fresh = (time.time() - self._state_ts_wall) < self._state_timeout
             if fresh:
                 return self._state_dq.copy()
-        return np.zeros(PORTAL_STATE_ARM_FIELDS)
+        return np.zeros(self._map.arm_dof)
 
-    def ctrl_dual_arm_go_home(self) -> None:
-        logger_mp.info("[portal] ctrl_dual_arm_go_home ...")
-        self.ctrl_dual_arm(np.zeros(2 * PORTAL_ARM_DOF), np.zeros(2 * PORTAL_ARM_DOF))
+    def send_go_home(self) -> None:
+        logger_mp.info("[portal] send_go_home ...")
+        zeros = np.zeros(self._map.arm_dof)
+        self.send_targets(zeros, hand_q=np.zeros(self._map.hand_dof),
+                          vx=0.0, vy=0.0, vyaw=0.0, fsm_id=2)
         for _ in range(100):
             if np.all(np.abs(self.get_current_dual_arm_q()) < 0.05):
                 logger_mp.info("[portal] both arms reached home position (reported).")
@@ -487,12 +410,7 @@ class PortalTeleopBridge:
             time.sleep(0.05)
         logger_mp.warning("[portal] go_home timed out waiting for state feedback.")
 
-    # ------------------------------------------------------------------
-    # dex3 hand retargeting (replaces Dex3_1_Controller.control_process)
-    # ------------------------------------------------------------------
     def set_xr_motion_data_ready(self, value) -> None:
-        """Attach the xr_motion_data_ready shared Value (created later in
-        teleop_hand_and_arm.py) so the retargeting thread can gate on it."""
         self._xr_motion_data_ready_in = value
 
     def _hand_retarget_loop(self) -> None:
@@ -501,8 +419,8 @@ class PortalTeleopBridge:
         logger_mp.info("[portal] starting local dex3 hand retargeting ...")
         hand_retargeting = HandRetargeting(HandType.UNITREE_DEX3)
 
-        left_q_target = np.zeros(PORTAL_HAND_DOF)
-        right_q_target = np.zeros(PORTAL_HAND_DOF)
+        left_q_target = np.zeros(len(self._map.left_hand))
+        right_q_target = np.zeros(len(self._map.right_hand))
 
         while not self._stop_evt.is_set():
             start_time = time.time()
@@ -531,12 +449,8 @@ class PortalTeleopBridge:
                 action_data = np.concatenate((left_q_target, right_q_target))
                 with self._hand_lock:
                     self._hand_q[:] = action_data
-                if self._dual_hand_state_array_out is not None and self._dual_hand_action_array_out is not None:
-                    # No real hand state over portal (state schema has no hand
-                    # fields): report the commanded targets as state so that
-                    # recording keeps a plausible trajectory.
+                if self._dual_hand_action_array_out is not None:
                     with self._dual_hand_data_lock:
-                        self._dual_hand_state_array_out[:] = action_data
                         self._dual_hand_action_array_out[:] = action_data
             except Exception as exc:
                 logger_mp.warning(f"[portal] hand retargeting error: {exc}")
@@ -545,14 +459,7 @@ class PortalTeleopBridge:
             time.sleep(sleep_time)
         logger_mp.info("[portal] hand retargeting stopped.")
 
-    # ------------------------------------------------------------------
-    # ImageClient-compatible video API
-    # ------------------------------------------------------------------
     def get_cam_config(self) -> dict:
-        """TeleVuer still reads ImageClient keys (head_camera, …). Bind
-        portal.yaml `videos:` to those slots in declaration order. WebRTC
-        stays off; first yaml track enables head_camera ZMQ for render_to_xr.
-        """
         cam_config = copy.deepcopy(self._cam_config_raw)
         for slot in _TELEVUER_SLOTS:
             if slot not in cam_config:
@@ -588,7 +495,6 @@ class PortalTeleopBridge:
             return frame if frame is not None else _Frame(None)
 
     def get_head_frame(self):
-        """First portal.yaml `videos:` track (what TeleVuer renders)."""
         return self._get_frame_at(0)
 
     def get_left_wrist_frame(self):
@@ -597,7 +503,6 @@ class PortalTeleopBridge:
     def get_right_wrist_frame(self):
         return self._get_frame_at(2)
 
-    # ------------------------------------------------------------------
     def close(self) -> None:
         logger_mp.info("[portal] closing bridge ...")
         self._stop_evt.set()
