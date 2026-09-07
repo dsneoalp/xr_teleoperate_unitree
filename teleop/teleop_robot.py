@@ -4,6 +4,7 @@ No TeleVuer / IK. Pair with teleop_operator.py in the same LiveKit room.
 
     python teleop/teleop_robot.py --ee dex3 --arm G1_29
     python teleop/teleop_robot.py --ee dex3 --arm G1_29 --motion
+    python teleop/teleop_robot.py --ee dex3 --arm G1_29 --sim
 """
 import time
 import argparse
@@ -27,6 +28,25 @@ FSM_IDLE = 0
 FSM_TELEOP = 1
 FSM_HOME = 2
 ACTION_TIMEOUT = 0.2
+IMAGE_CLIENT_RETRIES = 50
+IMAGE_CLIENT_RETRY_S = 0.1
+
+
+def _connect_image_client(host: str):
+    """Subscribe to the Isaac teleimager ZMQ server; retry while it starts."""
+    from teleimager.image_client import ImageClient
+
+    last_error = None
+    for attempt in range(1, IMAGE_CLIENT_RETRIES + 1):
+        try:
+            client = ImageClient(host=host, request_bgr=True)
+            logger_mp.info(f"ImageClient connected to {host} (attempt {attempt})")
+            return client
+        except Exception as exc:
+            last_error = exc
+            time.sleep(IMAGE_CLIENT_RETRY_S)
+    logger_mp.warning(f"ImageClient failed after {IMAGE_CLIENT_RETRIES} tries: {last_error}")
+    return None
 
 
 if __name__ == '__main__':
@@ -37,6 +57,8 @@ if __name__ == '__main__':
     parser.add_argument('--motion', action='store_true')
     parser.add_argument('--network-interface', type=str, default=None)
     parser.add_argument('--sim', action='store_true')
+    parser.add_argument('--img-server-ip', type=str, default='127.0.0.1',
+                        help='Isaac teleimager host (ZMQ config port 60000)')
     parser.add_argument('--portal-yaml', type=str, default=os.path.join(current_dir, 'portal.yaml'))
     parser.add_argument('--portal-mapping', type=str, default=os.path.join(current_dir, 'portal_mapping.yaml'))
     parser.add_argument('--env-file', type=str, default=os.path.join(current_dir, '.env'))
@@ -61,6 +83,7 @@ if __name__ == '__main__':
 
     arm_ctrl = G1_29_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
 
+    # DDS apply only. XR→Dex3 retargeting runs on the operator; actions arrive as hand_q.
     hand_ctrl = None
     if args.ee == "dex3":
         from teleop.robot_control.robot_hand_unitree import Dex3_1_Controller
@@ -74,6 +97,10 @@ if __name__ == '__main__':
         room=args.livekit_room,
         url=args.livekit_url)
     portal.wait_until_connected()
+
+    img_client = _connect_image_client(args.img_server_ip) if args.sim else None
+    video_track = portal.video_tracks[0] if portal.video_tracks else None
+    video_logged = False
 
     lock = threading.Lock()
     latest = {'action': None, 'wall': 0.0}
@@ -102,6 +129,8 @@ if __name__ == '__main__':
                     arm_ctrl.ctrl_dual_arm_go_home()
                     applied_fsm = FSM_HOME
             elif fsm == FSM_TELEOP and fresh:
+                if applied_fsm != FSM_TELEOP:
+                    arm_ctrl.speed_gradual_max()
                 tauff = np.zeros_like(action.arm_q)
                 arm_ctrl.ctrl_dual_arm(action.arm_q, tauff)
                 if hand_ctrl is not None and action.hand_q.size:
@@ -117,6 +146,18 @@ if __name__ == '__main__':
             hand_q = hand_ctrl.get_current_dual_hand_q() if hand_ctrl is not None else None
             portal.send_state(motor_q=motor_q, hand_q=hand_q, fsm_id=fsm)
 
+            if img_client is not None and video_track:
+                head = img_client.get_head_frame()
+                if head is not None and getattr(head, "bgr", None) is not None:
+                    rgb = np.ascontiguousarray(head.bgr[:, :, ::-1])
+                    portal.send_video_frame(
+                        video_track, rgb, timestamp_us=int(time.time() * 1_000_000))
+                    if not video_logged:
+                        h, w = rgb.shape[:2]
+                        logger_mp.info(
+                            f"publishing '{video_track}' {w}x{h} from {args.img_server_ip}")
+                        video_logged = True
+
             sleep = max(0.0, (1.0 / args.frequency) - (time.time() - start))
             time.sleep(sleep)
     except KeyboardInterrupt:
@@ -130,4 +171,9 @@ if __name__ == '__main__':
             portal.close()
         except Exception as e:
             logger_mp.error(f"portal close failed: {e}")
+        if img_client is not None:
+            try:
+                img_client.close()
+            except Exception as e:
+                logger_mp.error(f"ImageClient close failed: {e}")
         logger_mp.info("robot exited.")

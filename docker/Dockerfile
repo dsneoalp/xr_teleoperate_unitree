@@ -77,18 +77,31 @@ FROM base AS mock
 CMD ["python", "portal_robot_mock.py"]
 
 # ----- robot: README 1.2 unitree_sdk2_python at a pinned commit -----
+# setup.py has no package_data for utils/lib/*.so; pip install git+… drops crc_*.so.
 FROM base AS robot
 ARG UNITREE_SDK2_REF
 RUN apt-get update && apt-get install -y --no-install-recommends git \
-    && pip install --no-cache-dir --no-deps \
-        "git+https://github.com/unitreerobotics/unitree_sdk2_python.git@${UNITREE_SDK2_REF}" \
+    && git clone https://github.com/unitreerobotics/unitree_sdk2_python.git /tmp/unitree_sdk2_python \
+    && git -C /tmp/unitree_sdk2_python checkout "${UNITREE_SDK2_REF}" \
+    && pip install --no-cache-dir --no-deps /tmp/unitree_sdk2_python \
     && pip install --no-cache-dir \
         "cyclonedds==0.10.2" \
         "opencv-python-headless>=4.8,<4.11" \
         "numpy<2.0.0" \
+        pyzmq \
+    && pip install --no-cache-dir --no-deps /app/teleop/teleimager \
+    && python -c "\
+import os, shutil, unitree_sdk2py.utils.crc as crc; \
+src = '/tmp/unitree_sdk2_python/unitree_sdk2py/utils/lib'; \
+dst = os.path.join(os.path.dirname(crc.__file__), 'lib'); \
+os.makedirs(dst, exist_ok=True); \
+shutil.copytree(src, dst, dirs_exist_ok=True)" \
+    && python -c "from unitree_sdk2py.utils.crc import CRC; CRC()" \
+    && python -c "from teleimager.image_client import ImageClient" \
+    && rm -rf /tmp/unitree_sdk2_python /root/.cache/pip \
     && apt-get purge -y git \
     && apt-get autoremove -y \
-    && rm -rf /var/lib/apt/lists/* /root/.cache/pip
+    && rm -rf /var/lib/apt/lists/*
 CMD ["python", "teleop_robot.py", "--ee", "dex3", "--arm", "G1_29"]
 
 # ----- operator: README 1.1 conda env tv (not FROM slim; one Python only) -----

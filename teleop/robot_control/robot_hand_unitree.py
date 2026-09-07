@@ -17,8 +17,6 @@ from multiprocessing import Process, Array, Value, Lock
 
 parent2_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(parent2_dir)
-from teleop.robot_control.hand_retargeting import HandRetargeting, HandType
-from teleop.utils.weighted_moving_filter import WeightedMovingFilter
 
 import logging_mp
 logger_mp = logging_mp.getLogger(__name__)
@@ -61,6 +59,8 @@ class Dex3_1_Controller:
         self.simulation_mode = simulation_mode
         self.apply_targets = apply_targets
         if not apply_targets:
+            # Portal robot uses apply_targets=True and never loads dex_retargeting.
+            from teleop.robot_control.hand_retargeting import HandRetargeting, HandType
             if not self.Unit_Test:
                 self.hand_retargeting = HandRetargeting(HandType.UNITREE_DEX3)
             else:
@@ -275,6 +275,7 @@ class Dex1_1_Gripper_Controller:
         self.simulation_mode = simulation_mode
         
         if filter and not self.simulation_mode:
+            from teleop.utils.weighted_moving_filter import WeightedMovingFilter
             self.smooth_filter = WeightedMovingFilter(np.array([0.5, 0.3, 0.2]), 2)
         else:
             self.smooth_filter = None

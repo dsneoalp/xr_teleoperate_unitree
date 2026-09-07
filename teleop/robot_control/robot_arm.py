@@ -87,12 +87,17 @@ class G1_29_ArmController:
         self.kd_high = 3.0
         self.kp_low = 80.0
         self.kd_low = 3.0
+        self.kp_foot = 10.0
+        self.kd_foot = 1.0
         self.kp_wrist = 40.0
         self.kd_wrist = 1.5
 
         self.all_motor_q = None
-        self.set_arm_velocity_limit()
+        self.set_arm_velocity_limit(40.0)
         self.control_dt = 1.0 / 250.0
+        self._speed_gradual_max = False
+        self._gradual_start_time = None
+        self._gradual_time = None
 
         if self.motion_mode:
             self.lowcmd_publisher = ChannelPublisher(kTopicLowCommand_Motion, hg_LowCmd)
@@ -119,8 +124,9 @@ class G1_29_ArmController:
         self.msg.mode_machine = self.get_mode_machine()
 
         self.all_motor_q = self.get_current_motor_q()
+        self.q_target = self.get_current_dual_arm_q()
         logger_mp.debug(f"Current all body motor state q:\n{self.all_motor_q} \n")
-        logger_mp.debug(f"Current two arms motor state q:\n{self.get_current_dual_arm_q()}\n")
+        logger_mp.debug(f"Current two arms motor state q:\n{self.q_target}\n")
         logger_mp.info("Lock all joints except two arms...")
 
         arm_indices = set(member.value for member in G1_29_JointArmIndex)
@@ -133,6 +139,9 @@ class G1_29_ArmController:
                 else:
                     self.msg.motor_cmd[id].kp = self.kp_low
                     self.msg.motor_cmd[id].kd = self.kd_low
+            elif self._Is_foot_motor(id):
+                self.msg.motor_cmd[id].kp = self.kp_foot
+                self.msg.motor_cmd[id].kd = self.kd_foot
             else:
                 if self._Is_weak_motor(id):
                     self.msg.motor_cmd[id].kp = self.kp_low
@@ -182,10 +191,7 @@ class G1_29_ArmController:
                 arm_q_target     = self.q_target
                 arm_tauff_target = self.tauff_target
 
-            if self.simulation_mode:
-                cliped_arm_q_target = arm_q_target
-            else:
-                cliped_arm_q_target = self.clip_arm_q_target(arm_q_target, velocity_limit = self.arm_velocity_limit)
+            cliped_arm_q_target = self.clip_arm_q_target(arm_q_target, velocity_limit = self.arm_velocity_limit)
 
             for idx, id in enumerate(G1_29_JointArmIndex):
                 self.msg.motor_cmd[id].q = cliped_arm_q_target[idx]
@@ -194,6 +200,11 @@ class G1_29_ArmController:
 
             self.msg.crc = self.crc.Crc(self.msg)
             self.lowcmd_publisher.Write(self.msg)
+
+            if self._speed_gradual_max:
+                t_elapsed = start_time - self._gradual_start_time
+                duration = self._gradual_time if self._gradual_time else 5.0
+                self.arm_velocity_limit = 20.0 + (10.0 * min(1.0, t_elapsed / duration))
 
             current_time = time.time()
             all_t_elapsed = current_time - start_time
@@ -253,6 +264,26 @@ class G1_29_ArmController:
         if not np.isfinite(velocity_limit) or velocity_limit <= 0.0:
             raise ValueError("arm_velocity_limit must be a positive finite value.")
         self.arm_velocity_limit = velocity_limit
+
+    def speed_gradual_max(self, t = 5.0):
+        '''Ramp arm velocity from 20 rad/s to 30 rad/s over t seconds.'''
+        self._gradual_start_time = time.time()
+        self._gradual_time = t
+        self._speed_gradual_max = True
+
+    def speed_instant_max(self):
+        '''Set arm velocity to the maximum immediately instead of ramping.'''
+        self._speed_gradual_max = False
+        self.arm_velocity_limit = 30.0
+
+    def _Is_foot_motor(self, motor_index):
+        foot_motors = [
+            G1_29_JointIndex.kLeftAnklePitch.value,
+            G1_29_JointIndex.kLeftAnkleRoll.value,
+            G1_29_JointIndex.kRightAnklePitch.value,
+            G1_29_JointIndex.kRightAnkleRoll.value,
+        ]
+        return motor_index.value in foot_motors
 
     def _Is_weak_motor(self, motor_index):
         weak_motors = [
