@@ -114,7 +114,9 @@ if __name__ == '__main__':
                 applied_fsm = FSM_IDLE
 
             motor_q = arm_ctrl.get_current_motor_q()
+            logger_mp.info(f"Current arm joins: {motor_q}")   
             hand_q = hand_ctrl.get_current_dual_hand_q() if hand_ctrl is not None else None
+            logger_mp.info(f"Current hand joins: {hand_q}")
             portal.send_state(motor_q=motor_q, hand_q=hand_q, fsm_id=fsm)
 
             sleep = max(0.0, (1.0 / args.frequency) - (time.time() - start))

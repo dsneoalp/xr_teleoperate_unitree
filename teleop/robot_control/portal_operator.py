@@ -181,6 +181,10 @@ class PortalTeleopBridge:
         for track in self._declared_videos:
             self._op.on_video_frame(track, self._on_video_frame)
         self._frames_logged = set()
+        self._video_cb_count = 0
+        self._obs_frame_count = 0
+        self._video_last_ts_us = 0
+        self._video_last_wall = 0.0
 
         arm_dof = self._map.arm_dof
         hand_dof = self._map.hand_dof
@@ -274,10 +278,12 @@ class PortalTeleopBridge:
         hand_new = self._map.unpack_hand_q(raw)
 
         frames = {}
+        obs_frame_n = 0
         for name, frame in (getattr(obs, "frames", None) or {}).items():
             stored = self._decode_video_frame(name, frame)
             if stored:
                 frames.update(stored)
+                obs_frame_n += 1
 
         with self._obs_lock:
             self._obs_ts_us = ts_us
@@ -292,7 +298,12 @@ class PortalTeleopBridge:
                 self._prev_state_ts_us = ts_us
                 self._state_q = q_new
                 self._state_ts_wall = wall
-            self._frames.update(frames)
+            if frames:
+                self._frames.update(frames)
+                self._obs_frame_count += obs_frame_n
+                last = list(frames.values())[-1]
+                self._video_last_ts_us = last.timestamp_us
+                self._video_last_wall = wall
 
         if (hand_new is not None
                 and self._dual_hand_state_array_out is not None
@@ -307,6 +318,10 @@ class PortalTeleopBridge:
             return
         with self._obs_lock:
             self._frames.update(stored)
+            self._video_cb_count += 1
+            wrapped = next(iter(stored.values()))
+            self._video_last_ts_us = wrapped.timestamp_us
+            self._video_last_wall = time.time()
 
     def _slot_for_track(self, track: str) -> str | None:
         try:
@@ -398,6 +413,28 @@ class PortalTeleopBridge:
                 return self._state_dq.copy()
         return np.zeros(self._map.arm_dof)
 
+    def get_video_debug(self) -> dict:
+        with self._obs_lock:
+            return {
+                "video_cb_count": self._video_cb_count,
+                "obs_frame_count": self._obs_frame_count,
+                "last_ts_us": self._video_last_ts_us,
+                "last_wall": self._video_last_wall,
+            }
+
+    def get_state_debug(self) -> dict:
+        now = time.time()
+        with self._obs_lock:
+            if self._state_ts_wall:
+                age_s = now - self._state_ts_wall
+            else:
+                age_s = float("inf")
+            fresh = age_s < self._state_timeout and self._state_q is not None
+        return {
+            "q_src": "obs" if fresh else "last_sent",
+            "obs_age_ms": age_s * 1000.0,
+        }
+
     def send_go_home(self) -> None:
         logger_mp.info("[portal] send_go_home ...")
         zeros = np.zeros(self._map.arm_dof)
@@ -421,6 +458,7 @@ class PortalTeleopBridge:
 
         left_q_target = np.zeros(len(self._map.left_hand))
         right_q_target = np.zeros(len(self._map.right_hand))
+        last_dbg = 0.0
 
         while not self._stop_evt.is_set():
             start_time = time.time()
@@ -452,6 +490,14 @@ class PortalTeleopBridge:
                 if self._dual_hand_action_array_out is not None:
                     with self._dual_hand_data_lock:
                         self._dual_hand_action_array_out[:] = action_data
+                if start_time - last_dbg >= 1.0:
+                    last_dbg = start_time
+                    logger_mp.info(
+                        f"[portal 1Hz] dex3 xr_ready={int(bool(xr_ready))} "
+                        f"handL_norm={np.linalg.norm(left_hand_data):.3f} "
+                        f"handR_norm={np.linalg.norm(right_hand_data):.3f} "
+                        f"left_thumb_mcp={float(action_data[0]):.4f}"
+                    )
             except Exception as exc:
                 logger_mp.warning(f"[portal] hand retargeting error: {exc}")
 

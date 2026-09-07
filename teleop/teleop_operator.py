@@ -9,6 +9,7 @@ import time
 import argparse
 from multiprocessing import Value, Array, Lock
 import threading
+import numpy as np
 import logging_mp
 logging_mp.basicConfig(level=logging_mp.INFO)
 logger_mp = logging_mp.getLogger(__name__)
@@ -30,6 +31,33 @@ LOCO_SCALE = 0.3
 FSM_IDLE = 0
 FSM_TELEOP = 1
 FSM_HOME = 2
+
+
+def _mat_is_valid(mat) -> bool:
+    det = np.linalg.det(mat)
+    return bool(np.isfinite(det) and not np.isclose(det, 0.0, atol=1e-6))
+
+
+def _xyz(mat) -> np.ndarray:
+    return np.asarray(mat)[:3, 3]
+
+
+def _bar_col(bgr) -> int:
+    if bgr is None or getattr(bgr, "size", 0) == 0:
+        return -1
+    return int(np.argmax(bgr[:, :, 0].mean(axis=0)))
+
+
+def _guess_lan_ip() -> str:
+    import socket
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.connect(("8.8.8.8", 80))
+        ip = sock.getsockname()[0]
+        sock.close()
+        return ip
+    except Exception:
+        return "<host-ip>"
 
 START = False
 STOP = False
@@ -156,18 +184,46 @@ if __name__ == '__main__':
                 rerun_log=not args.headless)
 
         logger_mp.info("----------------------------------------------------------------")
+        lan_ip = _guess_lan_ip()
+        logger_mp.info(
+            f"XR headset: open https://{lan_ip}:8012/?ws=wss://{lan_ip}:8012 "
+            "then click Virtual Reality and allow hand tracking. "
+            "Native Quest/Pico hands are NOT TeleVuer events.")
+        logger_mp.info("Until cam_move>0, wrist poses stay CONST (no HAND_MOVE/CAMERA_MOVE).")
         logger_mp.info("Press [r] to start syncing the robot with your movements.")
         if args.record:
             logger_mp.info("Press [s] to START or SAVE recording (toggle cycle).")
         logger_mp.info("Press [q] to stop and exit the program.")
         READY = True
         teleop_bridge.set_fsm_id(FSM_IDLE)
+        wait_dbg = {"last_log": 0.0, "video_cb": 0, "hand_move": 0, "cam_move": 0}
         while not START and not STOP:
             time.sleep(0.033)
             if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
                 head_img = teleop_bridge.get_head_frame()
                 if head_img.bgr is not None:
                     tv_wrapper.render_to_xr(head_img.bgr)
+            now = time.time()
+            if now - wait_dbg["last_log"] >= 1.0:
+                dt = now - wait_dbg["last_log"] if wait_dbg["last_log"] else 1.0
+                video = teleop_bridge.get_video_debug()
+                hand_n = tv_wrapper.tvuer.hand_move_count
+                cam_n = tv_wrapper.tvuer.cam_move_count
+                idle_head = teleop_bridge.get_head_frame()
+                bar = _bar_col(idle_head.bgr)
+                hand_rate = int((hand_n - wait_dbg['hand_move']) / dt)
+                cam_rate = int((cam_n - wait_dbg['cam_move']) / dt)
+                xr_hint = "" if cam_rate > 0 else " NO_XR_SESSION"
+                logger_mp.info(
+                    f"[op idle 1Hz] hand_move={hand_rate}/s "
+                    f"cam_move={cam_rate}/s "
+                    f"video_cb_fps={int((video['video_cb_count'] - wait_dbg['video_cb']) / dt)} "
+                    f"bar_col={bar} (press r to start tracking){xr_hint}"
+                )
+                wait_dbg["last_log"] = now
+                wait_dbg["video_cb"] = video["video_cb_count"]
+                wait_dbg["hand_move"] = hand_n
+                wait_dbg["cam_move"] = cam_n
 
         logger_mp.info("start Tracking")
         teleop_bridge.set_fsm_id(FSM_TELEOP)
@@ -175,6 +231,13 @@ if __name__ == '__main__':
         head_img = None
         left_wrist_img = None
         right_wrist_img = None
+        dbg = {
+            "last_log": 0.0,
+            "hand_move": 0,
+            "cam_move": 0,
+            "video_cb": 0,
+            "obs_frame": 0,
+        }
 
         while not STOP:
             start_time = time.time()
@@ -225,6 +288,53 @@ if __name__ == '__main__':
             del sol_tauff
             fsm = FSM_TELEOP if START else FSM_IDLE
             teleop_bridge.send_targets(sol_q, vx=vx, vy=vy, vyaw=vyaw, fsm_id=fsm)
+
+            now = time.time()
+            if now - dbg["last_log"] >= 1.0:
+                dt = now - dbg["last_log"] if dbg["last_log"] else 1.0
+                raw_l = tv_wrapper.tvuer.left_arm_pose
+                raw_r = tv_wrapper.tvuer.right_arm_pose
+                wrist_l = _xyz(tele_data.left_wrist_pose)
+                hand_l = tele_data.left_hand_pos
+                hand_norm = float(np.linalg.norm(hand_l)) if hand_l is not None else 0.0
+                video = teleop_bridge.get_video_debug()
+                state = teleop_bridge.get_state_debug()
+                hand_n = tv_wrapper.tvuer.hand_move_count
+                cam_n = tv_wrapper.tvuer.cam_move_count
+                dbg_head = head_img if (head_img is not None and head_img.bgr is not None) \
+                    else teleop_bridge.get_head_frame()
+                bar = _bar_col(dbg_head.bgr) if dbg_head is not None else -1
+                if dbg_head is not None and getattr(dbg_head, "timestamp_us", 0):
+                    ts_age_ms = (now * 1_000_000 - dbg_head.timestamp_us) / 1000.0
+                elif video["last_wall"]:
+                    ts_age_ms = (now - video["last_wall"]) * 1000.0
+                else:
+                    ts_age_ms = -1.0
+                obs_age = state["obs_age_ms"]
+                obs_age_s = "inf" if not np.isfinite(obs_age) else f"{obs_age:.0f}"
+                raw_l_xyz = _xyz(raw_l)
+                logger_mp.info(
+                    f"[op 1Hz] xr_ready={int(bool(tele_data.motion_data_ready))} "
+                    f"hand_move={int((hand_n - dbg['hand_move']) / dt)}/s "
+                    f"cam_move={int((cam_n - dbg['cam_move']) / dt)}/s "
+                    f"rawL_det={np.linalg.det(raw_l):.3f} "
+                    f"rawL_xyz={raw_l_xyz[0]:.2f},{raw_l_xyz[1]:.2f},{raw_l_xyz[2]:.2f} "
+                    f"validL={int(_mat_is_valid(raw_l))} validR={int(_mat_is_valid(raw_r))} "
+                    f"wristL={wrist_l[0]:.2f},{wrist_l[1]:.2f},{wrist_l[2]:.2f} "
+                    f"handL_norm={hand_norm:.3f} "
+                    f"ik L_PITCH={float(sol_q[0]):.4f} R_PITCH={float(sol_q[7]):.4f} "
+                    f"warm L_PITCH={float(current_lr_arm_q[0]):.4f} "
+                    f"q_src={state['q_src']} obs_age_ms={obs_age_s} "
+                    f"video_cb_fps={int((video['video_cb_count'] - dbg['video_cb']) / dt)} "
+                    f"obs_frame_fps={int((video['obs_frame_count'] - dbg['obs_frame']) / dt)} "
+                    f"bar_col={bar} ts_age_ms={ts_age_ms:.0f} "
+                    f"loop_ms={(now - start_time) * 1000.0:.1f}"
+                )
+                dbg["last_log"] = now
+                dbg["hand_move"] = hand_n
+                dbg["cam_move"] = cam_n
+                dbg["video_cb"] = video["video_cb_count"]
+                dbg["obs_frame"] = video["obs_frame_count"]
 
             if args.record:
                 READY = recorder.is_ready()
