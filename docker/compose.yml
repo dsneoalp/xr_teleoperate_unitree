@@ -59,7 +59,6 @@ services:
     volumes:
       - ../teleop:/app/teleop
       - ../assets:/app/assets
-      - ../docker/entrypoint-operator.sh:/entrypoint-operator.sh:ro
       - operator-certs:/certs
     shm_size: "256mb"
     stdin_open: true
