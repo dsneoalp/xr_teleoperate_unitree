@@ -3,15 +3,15 @@
 #   docker compose -f docker/compose.yml build mock operator robot
 #   docker compose -f docker/compose.yml up mock
 #   docker compose -f docker/compose.yml run --rm -it operator
+#
+# teleop/ is bind-mounted so host edits apply on container restart (no rebuild).
+# New pip deps or Dockerfile changes still need: docker compose -f docker/compose.yml build
 
 name: xr-teleop
 
 x-portal-build: &portal-build
   context: ..
   dockerfile: docker/Dockerfile
-  additional_contexts:
-    portalpkg: /home/neoalp/portal/python/packages/livekit-portal
-    unitreesdk: /home/neoalp/unitree_sdk2_python
 
 services:
   mock:
@@ -24,6 +24,8 @@ services:
       - ../teleop/.env
     environment:
       PYTHONUNBUFFERED: "1"
+    volumes:
+      - ../teleop:/app/teleop
     stdin_open: true
     tty: true
     restart: "no"
@@ -38,6 +40,8 @@ services:
       - ../teleop/.env
     environment:
       PYTHONUNBUFFERED: "1"
+    volumes:
+      - ../teleop:/app/teleop
     stdin_open: true
     tty: true
     restart: "no"
@@ -53,7 +57,11 @@ services:
     environment:
       PYTHONUNBUFFERED: "1"
     volumes:
+      - ../teleop:/app/teleop
+      - ../assets:/app/assets
+      - ../docker/entrypoint-operator.sh:/entrypoint-operator.sh:ro
       - operator-certs:/certs
+    shm_size: "256mb"
     stdin_open: true
     tty: true
     restart: "no"

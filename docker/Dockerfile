@@ -1,47 +1,94 @@
 # Multi-stage: mock (LiveKit only), robot (DDS + SDK), operator (README conda env tv).
-# livekit-portal FFI is injected as extra context `portalpkg` (prebuilt .so).
-# Python 3.10: cyclonedds==0.10.2 (Unitree pin) has binary wheels; 3.11 is sdist-only.
+# livekit-portal PyPI wheels are cp312-only; we build the FFI from git for Python 3.10.
+# unitree_sdk2_python is pip-installed at a pinned commit — no host checkouts.
 #   docker compose -f docker/compose.yml build mock operator robot
+
+ARG PORTAL_REF=4fb4385f3e4bfc8e5019abce64be9042d338166e
+ARG UNITREE_SDK2_REF=65691c8a8bc53b98d3976dba4dbf9d5d20b2e7f5
+
+# ----- livekit-portal wheel (Python 3.10 + Rust FFI) -----
+FROM python:3.10-bookworm AS portal-build
+ARG PORTAL_REF
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git curl ca-certificates build-essential pkg-config \
+        clang libclang-dev \
+        libssl-dev libglib2.0-dev libx11-dev libxext-dev libxfixes-dev \
+        libxdamage-dev libxrandr-dev libxcomposite-dev libgl1-mesa-dev \
+        libgbm-dev libdrm-dev libva-dev \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain stable \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PATH=/root/.cargo/bin:$PATH
+
+RUN git clone https://github.com/livekit/portal.git /src/portal \
+    && git -C /src/portal checkout "${PORTAL_REF}"
+
+WORKDIR /src/portal
+RUN bash scripts/build_ffi_python.sh release
+
+WORKDIR /src/portal/python/packages/livekit-portal
+RUN pip install --no-cache-dir hatchling hatch-vcs \
+    && pip wheel --no-deps --no-cache-dir . -w /wheels
 
 FROM python:3.10-slim-bookworm AS base
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONPATH=/app:/opt/livekit-portal \
+    PYTHONPATH=/app \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         libglib2.0-0 \
         libgomp1 \
+        libssl3 \
+        libx11-6 \
+        libxext6 \
+        libxfixes3 \
+        libgl1 \
+        libgbm1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY --from=portalpkg / /opt/livekit-portal
+COPY --from=portal-build /wheels /tmp/wheels
 RUN pip install --no-cache-dir \
         "numpy<2.0.0" \
         pyyaml \
         python-dotenv \
         "livekit-api>=0.7" \
-        logging-mp
+        logging-mp \
+        /tmp/wheels/*.whl \
+    && rm -rf /tmp/wheels
 
 COPY teleop/ /app/teleop/
 WORKDIR /app/teleop
+RUN python -c "from livekit.portal import OperatorConfig, RobotConfig; \
+    OperatorConfig.from_yaml_file('/app/teleop/portal.yaml', 'x'); \
+    RobotConfig.from_yaml_file('/app/teleop/portal.yaml', 'x')"
 
 # ----- mock: echo actions / test-pattern video, no Unitree SDK -----
 FROM base AS mock
 CMD ["python", "portal_robot_mock.py"]
 
-# ----- robot: README 1.2 unitree_sdk2_python -----
+# ----- robot: README 1.2 unitree_sdk2_python at a pinned commit -----
 FROM base AS robot
-COPY --from=unitreesdk / /opt/unitree_sdk2_python
-RUN pip install --no-cache-dir --no-deps /opt/unitree_sdk2_python \
+ARG UNITREE_SDK2_REF
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && pip install --no-cache-dir --no-deps \
+        "git+https://github.com/unitreerobotics/unitree_sdk2_python.git@${UNITREE_SDK2_REF}" \
     && pip install --no-cache-dir \
         "cyclonedds==0.10.2" \
         "opencv-python-headless>=4.8,<4.11" \
-        "numpy<2.0.0"
+        "numpy<2.0.0" \
+    && apt-get purge -y git \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/* /root/.cache/pip
 CMD ["python", "teleop_robot.py", "--ee", "dex3", "--arm", "G1_29"]
 
 # ----- operator: README 1.1 conda env tv (not FROM slim; one Python only) -----
@@ -70,6 +117,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libsm6 \
         libxext6 \
         libxrender1 \
+        libssl3 \
+        libx11-6 \
+        libxfixes3 \
+        libgbm1 \
         openssl \
     && curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest \
         | tar -xvj -C /usr/local bin/micromamba \
@@ -81,7 +132,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY --from=portalpkg / /opt/livekit-portal
 COPY teleop/ /app/teleop/
 COPY requirements.txt /app/requirements.txt
 COPY assets/g1 /app/assets/g1
@@ -112,13 +162,21 @@ RUN pip install --no-cache-dir -e /app/teleop/teleimager --no-deps \
 RUN pip install --no-cache-dir "params-proto==2.13.2" \
     && rm -rf /root/.cache/pip
 
+COPY --from=portal-build /wheels /tmp/wheels
+RUN pip install --no-cache-dir /tmp/wheels/*.whl \
+    && python -c "from livekit.portal import OperatorConfig, RobotConfig; \
+        OperatorConfig.from_yaml_file('/app/teleop/portal.yaml', 'x'); \
+        RobotConfig.from_yaml_file('/app/teleop/portal.yaml', 'x')" \
+    && rm -rf /tmp/wheels /root/.cache/pip
+
 COPY docker/entrypoint-operator.sh /entrypoint-operator.sh
 RUN chmod +x /entrypoint-operator.sh \
     && mkdir -p /certs
 
 WORKDIR /app/teleop
 
-ENV XR_TELEOP_CERT=/certs/cert.pem \
+ENV PYTHONPATH=/app \
+    XR_TELEOP_CERT=/certs/cert.pem \
     XR_TELEOP_KEY=/certs/key.pem
 
 ENTRYPOINT ["/entrypoint-operator.sh"]
