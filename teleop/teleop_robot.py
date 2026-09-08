@@ -7,6 +7,7 @@ No TeleVuer / IK. Pair with teleop_operator.py in the same LiveKit room.
     python teleop/teleop_robot.py --ee dex3 --arm G1_29 --sim
 """
 import time
+import math
 import argparse
 import threading
 import logging_mp
@@ -31,6 +32,44 @@ FSM_HOME = 2
 ACTION_TIMEOUT = 0.2
 IMAGE_CLIENT_RETRIES = 50
 IMAGE_CLIENT_RETRY_S = 0.1
+
+
+def interp_cmd(state, q_cmd, now, tau):
+    """Linear segment q0→q1 over tau s. Restart on a new target; hold at s=1."""
+    q_cmd = np.asarray(q_cmd, dtype=float)
+    if tau <= 0.0:
+        state['q'] = q_cmd.copy()
+        return q_cmd
+    if 'q' not in state:
+        state['q'] = q_cmd.copy()
+        state['q0'] = q_cmd.copy()
+        state['q1'] = q_cmd.copy()
+        state['t0'] = now
+        return q_cmd.copy()
+    prev = state.get('q1')
+    if prev is None or prev.shape != q_cmd.shape or not np.allclose(q_cmd, prev):
+        state['q0'] = np.asarray(state['q'], dtype=float).copy()
+        state['q1'] = q_cmd.copy()
+        state['t0'] = now
+    s = min(1.0, (now - state['t0']) / tau)
+    q = (1.0 - s) * state['q0'] + s * state['q1']
+    state['q'] = q
+    return q
+
+
+def filter_cmd(state, q_cmd, dt, tau):
+    """PT1 toward q_cmd. Continues catching up while the target is held."""
+    q_cmd = np.asarray(q_cmd, dtype=float)
+    if tau <= 0.0:
+        state['q'] = q_cmd.copy()
+        return q_cmd
+    if 'q' not in state:
+        state['q'] = q_cmd.copy()
+        return q_cmd.copy()
+    alpha = 1.0 - math.exp(-max(dt, 1e-6) / tau)
+    q = state['q'] + alpha * (q_cmd - state['q'])
+    state['q'] = q
+    return q
 
 
 def _connect_image_client(host: str):
@@ -91,6 +130,8 @@ if __name__ == '__main__':
     parser.add_argument('--livekit-url', type=str, default=None)
     parser.add_argument('--livekit-room', type=str, default=None)
     parser.add_argument('--portal-identity', type=str, default='xr-robot')
+    parser.add_argument('--cmd-tau', type=float, default=0.15,
+                        help='command smoothing time (s); 0 = off. Switch interp/filter in the TELEOP loop.')
     args = parser.parse_args()
 
     from unitree_sdk2py.core.channel import ChannelFactoryInitialize
@@ -141,6 +182,9 @@ if __name__ == '__main__':
     applied_fsm = FSM_IDLE
     timing = LoopTiming(logger_mp)
     last_action_wall = {'t': 0.0}
+    arm_cmd = {}
+    hand_cmd = {}
+    last_tick = 0.0
 
     def on_action(action: UnpackedAction):
         now = time.time()
@@ -158,6 +202,8 @@ if __name__ == '__main__':
     try:
         while True:
             start = time.time()
+            dt = (start - last_tick) if last_tick else (1.0 / args.frequency)
+            last_tick = start
             with lock:
                 action = latest['action']
                 age = start - latest['wall'] if latest['wall'] else 1e9
@@ -174,19 +220,33 @@ if __name__ == '__main__':
                 if applied_fsm != FSM_HOME:
                     arm_ctrl.ctrl_dual_arm_go_home()
                     applied_fsm = FSM_HOME
+                arm_cmd.clear()
+                hand_cmd.clear()
             elif fsm == FSM_TELEOP and action:
                 if applied_fsm != FSM_TELEOP:
                     arm_ctrl.speed_gradual_max()
+                    arm_cmd.clear()
+                    arm_cmd['q'] = np.asarray(arm_ctrl.get_current_dual_arm_q(), dtype=float).copy()
+                    hand_cmd.clear()
+                    if hand_ctrl is not None:
+                        hand_cmd['q'] = np.asarray(hand_ctrl.get_current_dual_hand_q(), dtype=float).copy()
                 tauff = np.zeros_like(action.arm_q)
-                arm_ctrl.ctrl_dual_arm(action.arm_q, tauff)
+                # pick one (arm + hand must match):
+                arm_q = interp_cmd(arm_cmd, action.arm_q, start, args.cmd_tau)
+                # arm_q = filter_cmd(arm_cmd, action.arm_q, dt, args.cmd_tau)
+                arm_ctrl.ctrl_dual_arm(arm_q, tauff)
                 if hand_ctrl is not None and action.hand_q.size:
                     half = action.hand_q.size // 2
-                    hand_ctrl.ctrl_dual_hand(action.hand_q[:half], action.hand_q[half:])
+                    hand_q = interp_cmd(hand_cmd, action.hand_q, start, args.cmd_tau)
+                    # hand_q = filter_cmd(hand_cmd, action.hand_q, dt, args.cmd_tau)
+                    hand_ctrl.ctrl_dual_hand(hand_q[:half], hand_q[half:])
                 if loco_wrapper is not None:
                     loco_wrapper.Move(action.vx, action.vy, action.vyaw)
                 applied_fsm = FSM_TELEOP
             else:
                 applied_fsm = FSM_IDLE
+                arm_cmd.clear()
+                hand_cmd.clear()
 
             motor_q = arm_ctrl.get_current_motor_q()
             hand_q = hand_ctrl.get_current_dual_hand_q() if hand_ctrl is not None else None
