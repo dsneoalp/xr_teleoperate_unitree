@@ -4,9 +4,10 @@ Used by teleop_operator.py (not as arm_ctrl):
 
   * IK arm targets, dex3 retargeting, and loco (vx/vy/vyaw) are published
     as Portal actions at the teleop control rate.
-  * Robot state is received via on_observation; arm q feeds the IK warm
-    start, dq is estimated from Δq/Δt. Missing state dead-reckons with
-    the last sent targets.
+  * Robot state is received via on_observation (joints only; video is
+    decoded on on_video_frame). IK warm-starts from last sent targets so
+    delayed WAN state does not oscillate the solver. Missing state still
+    dead-reckons with those targets.
   * Video: every track listed under portal.yaml `videos:` is subscribed.
     TeleVuer / get_head_frame() shows the first entry; extra tracks map
     to left/right wrist in declaration order.
@@ -199,6 +200,8 @@ class PortalTeleopBridge:
         self._arm_lock = threading.Lock()
         self._q_target = np.zeros(arm_dof)
         self._last_sent_q = np.zeros(arm_dof)
+        self._last_sent_dq = np.zeros(arm_dof)
+        self._last_send_wall = 0.0
 
         self._hand_lock = threading.Lock()
         self._hand_q = np.zeros(hand_dof)
@@ -275,27 +278,14 @@ class PortalTeleopBridge:
         q_new = self._map.unpack_arm_q(raw)
         hand_new = self._map.unpack_hand_q(raw)
 
-        frames = {}
-        for name, frame in (getattr(obs, "frames", None) or {}).items():
-            stored = self._decode_video_frame(name, frame)
-            if stored:
-                frames.update(stored)
-
         rtt_ms = None
         with self._obs_lock:
             self._obs_ts_us = ts_us
             if q_new is not None:
-                if (self._prev_state_q is not None and ts_us is not None
-                        and self._prev_state_ts_us is not None
-                        and ts_us > self._prev_state_ts_us):
-                    dt = (ts_us - self._prev_state_ts_us) / 1e6
-                    if dt > 1e-4:
-                        self._state_dq = (q_new - self._prev_state_q) / dt
                 self._prev_state_q = q_new
                 self._prev_state_ts_us = ts_us
                 self._state_q = q_new
                 self._state_ts_wall = wall
-            self._frames.update(frames)
             sent = self._pending_action_wall
             if sent is not None:
                 rtt_ms = (wall - sent) * 1000.0
@@ -390,8 +380,14 @@ class PortalTeleopBridge:
             return
         with self._obs_lock:
             self._pending_action_wall = time.time()
+        now = time.time()
         with self._arm_lock:
+            if self._last_send_wall > 0:
+                dt = now - self._last_send_wall
+                if dt > 1e-4:
+                    self._last_sent_dq[:] = (q_arm - self._last_sent_q) / dt
             self._last_sent_q[:] = q_arm
+            self._last_send_wall = now
 
     def on_rtt(self, callback) -> None:
         """callback(rtt_ms) on the first observation after a successful send_action."""
@@ -409,19 +405,19 @@ class PortalTeleopBridge:
             self._fsm_id = int(fsm_id)
 
     def get_current_dual_arm_q(self) -> np.ndarray:
-        with self._obs_lock:
-            fresh = (time.time() - self._state_ts_wall) < self._state_timeout
-            if fresh and self._state_q is not None:
-                return self._state_q.copy()
+        """IK warm start: last commanded q, not delayed WAN robot state."""
         with self._arm_lock:
             return self._last_sent_q.copy()
 
     def get_current_dual_arm_dq(self) -> np.ndarray:
+        with self._arm_lock:
+            return self._last_sent_dq.copy()
+
+    def get_reported_arm_q(self) -> np.ndarray | None:
         with self._obs_lock:
-            fresh = (time.time() - self._state_ts_wall) < self._state_timeout
-            if fresh:
-                return self._state_dq.copy()
-        return np.zeros(self._map.arm_dof)
+            if self._state_q is None:
+                return None
+            return self._state_q.copy()
 
     def send_go_home(self) -> None:
         logger_mp.info("[portal] send_go_home ...")
@@ -429,7 +425,8 @@ class PortalTeleopBridge:
         self.send_targets(zeros, hand_q=np.zeros(self._map.hand_dof),
                           vx=0.0, vy=0.0, vyaw=0.0, fsm_id=2)
         for _ in range(100):
-            if np.all(np.abs(self.get_current_dual_arm_q()) < 0.05):
+            reported = self.get_reported_arm_q()
+            if reported is not None and np.all(np.abs(reported) < 0.05):
                 logger_mp.info("[portal] both arms reached home position (reported).")
                 return
             time.sleep(0.05)

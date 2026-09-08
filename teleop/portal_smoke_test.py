@@ -100,13 +100,13 @@ def test_portal_roundtrip() -> None:
             for i in range(40):
                 bridge.send_targets(target, hand_q=hand, vx=0.12, vy=-0.04, vyaw=0.08, fsm_id=1)
                 time.sleep(0.15)
-                q = bridge.get_current_dual_arm_q()
+                q = bridge.get_reported_arm_q()
                 if q is not None and np.allclose(q, target, atol=1e-3):
                     got = q
                     break
             if got is None:
                 raise AssertionError(
-                    f"operator never saw echoed arm q; last={bridge.get_current_dual_arm_q()}")
+                    f"operator never saw echoed arm q; last={bridge.get_reported_arm_q()}")
             print(f"OK  portal action→state echo (arm[0]={got[0]:.3f})")
 
             frame = None

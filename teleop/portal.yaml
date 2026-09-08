@@ -4,13 +4,13 @@ version: 1
 fps: 30
 slack: 10
 tolerance: 4.0
-state_reliable: true
-action_reliable: true
+state_reliable: false
+action_reliable: false
 reuse_stale_frames: false
 ping_ms: 1000
 videos:
   # First track is shown in TeleVuer. Name must match the robot publisher.
-  - { name: head_camera, codec: h264, screencast: false, max_bitrate_kbps: 2000 }
+  - { name: head_camera, codec: h264, screencast: false, max_bitrate_kbps: 1000 }
 state:
   # body ids 0–28, q in rad
   - { name: L_LEG_HIP_PITCH, dtype: f32 }

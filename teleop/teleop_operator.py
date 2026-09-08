@@ -254,8 +254,10 @@ if __name__ == '__main__':
                     left_hand_action = []
                     right_hand_action = []
                     current_body_action = [vx, vy, vyaw] if args.input_mode == "controller" else []
-                half = len(current_lr_arm_q) // 2
-                left_arm_state, right_arm_state = current_lr_arm_q[:half], current_lr_arm_q[half:]
+                reported = teleop_bridge.get_reported_arm_q()
+                rec_q = reported if reported is not None else current_lr_arm_q
+                half = len(rec_q) // 2
+                left_arm_state, right_arm_state = rec_q[:half], rec_q[half:]
                 left_arm_action, right_arm_action = sol_q[:half], sol_q[half:]
                 if RECORD_RUNNING:
                     colors = {}

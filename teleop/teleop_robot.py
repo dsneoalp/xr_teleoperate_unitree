@@ -50,6 +50,29 @@ def _connect_image_client(host: str):
     return None
 
 
+def _video_publish_loop(img_client, portal, track, stop_evt, fps: float):
+    """Grab latest ZMQ frame and publish off the control loop. Drop-oldest: no queue."""
+    logged = False
+    interval = 1.0 / max(fps, 1.0)
+    while not stop_evt.is_set():
+        t0 = time.time()
+        try:
+            head = img_client.get_head_frame()
+            if head is not None and getattr(head, "bgr", None) is not None:
+                rgb = np.ascontiguousarray(head.bgr[:, :, ::-1])
+                portal.send_video_frame(
+                    track, rgb, timestamp_us=int(time.time() * 1_000_000))
+                if not logged:
+                    h, w = rgb.shape[:2]
+                    logger_mp.info(f"publishing '{track}' {w}x{h} (video thread)")
+                    logged = True
+        except Exception as exc:
+            logger_mp.warning(f"video thread: {exc}")
+        sleep = interval - (time.time() - t0)
+        if sleep > 0:
+            stop_evt.wait(sleep)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--frequency', type=float, default=30.0, help='state publish rate')
@@ -101,7 +124,15 @@ if __name__ == '__main__':
 
     img_client = _connect_image_client(args.img_server_ip) if args.sim else None
     video_track = portal.video_tracks[0] if portal.video_tracks else None
-    video_logged = False
+    video_stop = threading.Event()
+    video_thread = None
+    if img_client is not None and video_track:
+        video_thread = threading.Thread(
+            target=_video_publish_loop,
+            args=(img_client, portal, video_track, video_stop, args.frequency),
+            daemon=True)
+        video_thread.start()
+        logger_mp.info("video publish thread started")
 
     lock = threading.Lock()
     latest = {'action': None, 'wall': 0.0}
@@ -159,18 +190,6 @@ if __name__ == '__main__':
             hand_q = hand_ctrl.get_current_dual_hand_q() if hand_ctrl is not None else None
             portal.send_state(motor_q=motor_q, hand_q=hand_q, fsm_id=fsm)
 
-            if img_client is not None and video_track:
-                head = img_client.get_head_frame()
-                if head is not None and getattr(head, "bgr", None) is not None:
-                    rgb = np.ascontiguousarray(head.bgr[:, :, ::-1])
-                    portal.send_video_frame(
-                        video_track, rgb, timestamp_us=int(time.time() * 1_000_000))
-                    if not video_logged:
-                        h, w = rgb.shape[:2]
-                        logger_mp.info(
-                            f"publishing '{video_track}' {w}x{h} from {args.img_server_ip}")
-                        video_logged = True
-
             sleep = max(0.0, (1.0 / args.frequency) - (time.time() - start))
             time.sleep(sleep)
     except KeyboardInterrupt:
@@ -184,6 +203,9 @@ if __name__ == '__main__':
             portal.close()
         except Exception as e:
             logger_mp.error(f"portal close failed: {e}")
+        video_stop.set()
+        if video_thread is not None:
+            video_thread.join(timeout=2.0)
         if img_client is not None:
             try:
                 img_client.close()
