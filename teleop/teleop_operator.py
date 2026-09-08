@@ -224,7 +224,6 @@ if __name__ == '__main__':
                 wait_dbg["video_cb"] = video["video_cb_count"]
                 wait_dbg["hand_move"] = hand_n
                 wait_dbg["cam_move"] = cam_n
-
         logger_mp.info("start Tracking")
         teleop_bridge.set_fsm_id(FSM_TELEOP)
 
@@ -286,7 +285,7 @@ if __name__ == '__main__':
                 tele_data.left_wrist_pose, tele_data.right_wrist_pose,
                 current_lr_arm_q, current_lr_arm_dq)
             del sol_tauff
-            fsm = FSM_TELEOP if START else FSM_IDLE
+            fsm = FSM_TELEOP if START else FSM_HOME
             teleop_bridge.send_targets(sol_q, vx=vx, vy=vy, vyaw=vyaw, fsm_id=fsm)
 
             now = time.time()

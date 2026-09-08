@@ -86,7 +86,7 @@ if __name__ == '__main__':
 
     portal.on_unpacked_action(on_action)
     logger_mp.info("robot loop running; waiting for operator actions")
-
+    
     try:
         while True:
             start = time.time()
