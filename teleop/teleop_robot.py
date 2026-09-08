@@ -34,7 +34,7 @@ IMAGE_CLIENT_RETRY_S = 0.1
 
 
 def _connect_image_client(host: str):
-    """Subscribe to the Isaac teleimager ZMQ server; retry while it starts."""
+    """Subscribe to the teleimager ZMQ server; retry while it starts."""
     from teleimager.image_client import ImageClient
 
     last_error = None
@@ -81,8 +81,10 @@ if __name__ == '__main__':
     parser.add_argument('--motion', action='store_true')
     parser.add_argument('--network-interface', type=str, default=None)
     parser.add_argument('--sim', action='store_true')
+    parser.add_argument('--no-img', action='store_true',
+                        help='do not subscribe to teleimager / publish video')
     parser.add_argument('--img-server-ip', type=str, default='127.0.0.1',
-                        help='Isaac teleimager host (ZMQ config port 60000)')
+                        help='teleimager ZMQ host (config port 60000)')
     parser.add_argument('--portal-yaml', type=str, default=os.path.join(current_dir, 'portal.yaml'))
     parser.add_argument('--portal-mapping', type=str, default=os.path.join(current_dir, 'portal_mapping.yaml'))
     parser.add_argument('--env-file', type=str, default=os.path.join(current_dir, '.env'))
@@ -122,7 +124,7 @@ if __name__ == '__main__':
         url=args.livekit_url)
     portal.wait_until_connected()
 
-    img_client = _connect_image_client(args.img_server_ip) if args.sim else None
+    img_client = None if args.no_img else _connect_image_client(args.img_server_ip)
     video_track = portal.video_tracks[0] if portal.video_tracks else None
     video_stop = threading.Event()
     video_thread = None
@@ -195,10 +197,7 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         logger_mp.info("KeyboardInterrupt, exiting ...")
     finally:
-        try:
-            arm_ctrl.ctrl_dual_arm_go_home()
-        except Exception as e:
-            logger_mp.error(f"go_home failed: {e}")
+
         try:
             portal.close()
         except Exception as e:
