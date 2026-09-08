@@ -23,6 +23,7 @@ sys.path.append(parent_dir)
 
 from teleop.robot_control.portal_robot import PortalRobotTransport
 from teleop.robot_control.portal_mapping import UnpackedAction
+from teleop.utils.loop_timing import LoopTiming
 
 FSM_IDLE = 0
 FSM_TELEOP = 1
@@ -105,11 +106,18 @@ if __name__ == '__main__':
     lock = threading.Lock()
     latest = {'action': None, 'wall': 0.0}
     applied_fsm = FSM_IDLE
+    timing = LoopTiming(logger_mp)
+    last_action_wall = {'t': 0.0}
 
     def on_action(action: UnpackedAction):
+        now = time.time()
         with lock:
+            prev = last_action_wall['t']
             latest['action'] = action
-            latest['wall'] = time.time()
+            latest['wall'] = now
+            last_action_wall['t'] = now
+        if prev:
+            timing.add("action_gap_ms", (now - prev) * 1000.0)
 
     portal.on_unpacked_action(on_action)
     logger_mp.info("robot loop running; waiting for operator actions")
@@ -122,13 +130,18 @@ if __name__ == '__main__':
                 age = start - latest['wall'] if latest['wall'] else 1e9
 
             fsm = action.fsm_id if action is not None else FSM_IDLE
-            fresh = action is not None and age < ACTION_TIMEOUT
+            # fresh = action is not None and age < ACTION_TIMEOUT
+            # timing.count("loops")
+            # if action is not None:
+            #     timing.add("age_ms", age * 1000.0)
+            # if not fresh:
+            #     timing.count("stale")
 
             if fsm == FSM_HOME:
                 if applied_fsm != FSM_HOME:
                     arm_ctrl.ctrl_dual_arm_go_home()
                     applied_fsm = FSM_HOME
-            elif fsm == FSM_TELEOP and fresh:
+            elif fsm == FSM_TELEOP and action:
                 if applied_fsm != FSM_TELEOP:
                     arm_ctrl.speed_gradual_max()
                 tauff = np.zeros_like(action.arm_q)

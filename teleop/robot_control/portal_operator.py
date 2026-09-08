@@ -193,6 +193,8 @@ class PortalTeleopBridge:
         self._prev_state_ts_us = None
         self._obs_ts_us = None
         self._frames = {}
+        self._pending_action_wall = None
+        self._rtt_cb = None
 
         self._arm_lock = threading.Lock()
         self._q_target = np.zeros(arm_dof)
@@ -279,6 +281,7 @@ class PortalTeleopBridge:
             if stored:
                 frames.update(stored)
 
+        rtt_ms = None
         with self._obs_lock:
             self._obs_ts_us = ts_us
             if q_new is not None:
@@ -293,6 +296,15 @@ class PortalTeleopBridge:
                 self._state_q = q_new
                 self._state_ts_wall = wall
             self._frames.update(frames)
+            sent = self._pending_action_wall
+            if sent is not None:
+                rtt_ms = (wall - sent) * 1000.0
+                self._pending_action_wall = None
+        if rtt_ms is not None and self._rtt_cb is not None:
+            try:
+                self._rtt_cb(rtt_ms)
+            except Exception as exc:
+                logger_mp.debug(f"[portal] rtt callback failed: {exc}")
 
         if (hand_new is not None
                 and self._dual_hand_state_array_out is not None
@@ -376,8 +388,21 @@ class PortalTeleopBridge:
         except Exception as exc:
             logger_mp.warning(f"[portal] send_action failed: {exc}")
             return
+        with self._obs_lock:
+            self._pending_action_wall = time.time()
         with self._arm_lock:
             self._last_sent_q[:] = q_arm
+
+    def on_rtt(self, callback) -> None:
+        """callback(rtt_ms) on the first observation after a successful send_action."""
+        self._rtt_cb = callback
+
+    def state_age_ms(self) -> float | None:
+        with self._obs_lock:
+            ts = self._state_ts_wall
+        if not ts:
+            return None
+        return (time.time() - ts) * 1000.0
 
     def set_fsm_id(self, fsm_id: int) -> None:
         with self._hand_lock:

@@ -25,6 +25,7 @@ from teleop.utils.episode_writer import EpisodeWriter
 from teleop.utils.ipc import IPC_Server
 from sshkeyboard import listen_keyboard, stop_listening
 from teleop.robot_control.portal_operator import PortalTeleopBridge
+from teleop.utils.loop_timing import LoopTiming
 
 LOCO_SCALE = 0.3
 FSM_IDLE = 0
@@ -172,6 +173,10 @@ if __name__ == '__main__':
         logger_mp.info("start Tracking")
         teleop_bridge.set_fsm_id(FSM_TELEOP)
 
+        timing = LoopTiming(logger_mp)
+        teleop_bridge.on_rtt(lambda rtt_ms: timing.add("rtt_ms", rtt_ms))
+        last_send_t = None
+
         head_img = None
         left_wrist_img = None
         right_wrist_img = None
@@ -219,11 +224,20 @@ if __name__ == '__main__':
 
             current_lr_arm_q = teleop_bridge.get_current_dual_arm_q()
             current_lr_arm_dq = teleop_bridge.get_current_dual_arm_dq()
+            ik_t0 = time.perf_counter()
             sol_q, sol_tauff = arm_ik.solve_ik(
                 tele_data.left_wrist_pose, tele_data.right_wrist_pose,
                 current_lr_arm_q, current_lr_arm_dq)
+            timing.add("ik_ms", (time.perf_counter() - ik_t0) * 1000.0)
             del sol_tauff
             fsm = FSM_TELEOP if START else FSM_IDLE
+            send_now = time.perf_counter()
+            if last_send_t is not None:
+                timing.add("send_gap_ms", (send_now - last_send_t) * 1000.0)
+            last_send_t = send_now
+            age_ms = teleop_bridge.state_age_ms()
+            if age_ms is not None:
+                timing.add("state_age_ms", age_ms)
             teleop_bridge.send_targets(sol_q, vx=vx, vy=vy, vyaw=vyaw, fsm_id=fsm)
 
             if args.record:
@@ -273,6 +287,7 @@ if __name__ == '__main__':
                     }
                     recorder.add_item(colors=colors, depths=depths, states=states, actions=actions)
 
+            timing.add("loop_ms", (time.time() - start_time) * 1000.0)
             sleep_time = max(0, (1 / args.frequency) - (time.time() - start_time))
             time.sleep(sleep_time)
 

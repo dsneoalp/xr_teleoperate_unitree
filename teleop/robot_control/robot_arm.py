@@ -87,7 +87,7 @@ class G1_29_ArmController:
         self.kd_high = 3.0
         self.kp_low = 80.0
         self.kd_low = 3.0
-        self.kp_foot = 10.0
+        self.kp_foot = 40.0
         self.kd_foot = 1.0
         self.kp_wrist = 40.0
         self.kd_wrist = 1.5
