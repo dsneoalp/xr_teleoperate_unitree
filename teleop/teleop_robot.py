@@ -28,24 +28,34 @@ FSM_IDLE = 0
 FSM_TELEOP = 1
 FSM_HOME = 2
 ACTION_TIMEOUT = 0.2
-IMAGE_CLIENT_RETRIES = 50
-IMAGE_CLIENT_RETRY_S = 0.1
+BGR_CONNECT_RETRIES = 50
+BGR_CONNECT_RETRY_S = 0.1
 
 
-def _connect_image_client(host: str):
-    """Subscribe to the Isaac teleimager ZMQ server; retry while it starts."""
-    from teleimager.image_client import ImageClient
+def _connect_bgr_source(host: str):
+    """Subscribe to sag-teleimager raw BGR ZMQ (zmq_port+1000), not ImageClient JPEG."""
+    from teleop.robot_control.bgr_source import (
+        BgrSource, fetch_teleimager_config, resolve_bgr_zmq_port)
 
+    config_port = int(os.environ.get("TELEIMAGER_CONFIG_PORT", "60000"))
+    max_w = int(os.environ.get(
+        "PORTAL_VIDEO_MAX_WIDTH", os.environ.get("PORTAL_FRAME_WIDTH", "640")))
+    max_h = int(os.environ.get(
+        "PORTAL_VIDEO_MAX_HEIGHT", os.environ.get("PORTAL_FRAME_HEIGHT", "480")))
     last_error = None
-    for attempt in range(1, IMAGE_CLIENT_RETRIES + 1):
+    for attempt in range(1, BGR_CONNECT_RETRIES + 1):
         try:
-            client = ImageClient(host=host, request_bgr=True)
-            logger_mp.info(f"ImageClient connected to {host} (attempt {attempt})")
-            return client
+            cfg = fetch_teleimager_config(host, config_port)
+            port = resolve_bgr_zmq_port(cfg)
+            source = BgrSource(host, port, max_width=max_w, max_height=max_h)
+            source.start()
+            logger_mp.info(
+                f"BGR source tcp://{host}:{port} max={max_w}x{max_h} (attempt {attempt})")
+            return source
         except Exception as exc:
             last_error = exc
-            time.sleep(IMAGE_CLIENT_RETRY_S)
-    logger_mp.warning(f"ImageClient failed after {IMAGE_CLIENT_RETRIES} tries: {last_error}")
+            time.sleep(BGR_CONNECT_RETRY_S)
+    logger_mp.warning(f"BGR source failed after {BGR_CONNECT_RETRIES} tries: {last_error}")
     return None
 
 
@@ -57,14 +67,17 @@ if __name__ == '__main__':
     parser.add_argument('--motion', action='store_true')
     parser.add_argument('--network-interface', type=str, default=None)
     parser.add_argument('--sim', action='store_true')
+    parser.add_argument('--no-img', action='store_true',
+                        help='do not subscribe to teleimager BGR / publish video')
     parser.add_argument('--img-server-ip', type=str, default='127.0.0.1',
-                        help='Isaac teleimager host (ZMQ config port 60000)')
+                        help='teleimager host (config port 60000, BGR = zmq_port+1000)')
     parser.add_argument('--portal-yaml', type=str, default=os.path.join(current_dir, 'portal.yaml'))
     parser.add_argument('--portal-mapping', type=str, default=os.path.join(current_dir, 'portal_mapping.yaml'))
     parser.add_argument('--env-file', type=str, default=os.path.join(current_dir, '.env'))
     parser.add_argument('--livekit-url', type=str, default=None)
     parser.add_argument('--livekit-room', type=str, default=None)
-    parser.add_argument('--portal-identity', type=str, default='xr-robot')
+    parser.add_argument('--portal-identity', type=str,
+                        default=os.environ.get('PORTAL_IDENTITY', 'xr-robot'))
     args = parser.parse_args()
 
     from unitree_sdk2py.core.channel import ChannelFactoryInitialize
@@ -98,9 +111,13 @@ if __name__ == '__main__':
         url=args.livekit_url)
     portal.wait_until_connected()
 
-    img_client = _connect_image_client(args.img_server_ip) if args.sim else None
+    bgr_source = None if args.no_img else _connect_bgr_source(args.img_server_ip)
     video_track = portal.video_tracks[0] if portal.video_tracks else None
     video_logged = False
+    video_sent = 0
+    video_skip = 0
+    last_seq = -1
+    video_log_wall = time.time()
 
     lock = threading.Lock()
     latest = {'action': None, 'wall': 0.0}
@@ -146,17 +163,33 @@ if __name__ == '__main__':
             hand_q = hand_ctrl.get_current_dual_hand_q() if hand_ctrl is not None else None
             portal.send_state(motor_q=motor_q, hand_q=hand_q, fsm_id=fsm)
 
-            if img_client is not None and video_track:
-                head = img_client.get_head_frame()
-                if head is not None and getattr(head, "bgr", None) is not None:
-                    rgb = np.ascontiguousarray(head.bgr[:, :, ::-1])
-                    portal.send_video_frame(
-                        video_track, rgb, timestamp_us=int(time.time() * 1_000_000))
-                    if not video_logged:
-                        h, w = rgb.shape[:2]
-                        logger_mp.info(
-                            f"publishing '{video_track}' {w}x{h} from {args.img_server_ip}")
-                        video_logged = True
+            if bgr_source is not None and video_track:
+                latest_frame = bgr_source.latest()
+                if latest_frame is None:
+                    video_skip += 1
+                else:
+                    rgb, capture_us, seq = latest_frame
+                    if seq == last_seq:
+                        video_skip += 1
+                    else:
+                        last_seq = seq
+                        ts = capture_us or int(time.time() * 1_000_000)
+                        portal.send_video_frame(video_track, rgb, timestamp_us=ts)
+                        video_sent += 1
+                        if not video_logged:
+                            h, w = rgb.shape[:2]
+                            logger_mp.info(
+                                f"publishing '{video_track}' {w}x{h} RGB as "
+                                f"'{args.portal_identity}' from {args.img_server_ip}")
+                            video_logged = True
+                now = time.time()
+                if now - video_log_wall >= 5.0:
+                    logger_mp.info(
+                        f"video '{video_track}' sent={video_sent} skip={video_skip} "
+                        f"in last {now - video_log_wall:.1f}s")
+                    video_sent = 0
+                    video_skip = 0
+                    video_log_wall = now
 
             sleep = max(0.0, (1.0 / args.frequency) - (time.time() - start))
             time.sleep(sleep)
@@ -171,9 +204,9 @@ if __name__ == '__main__':
             portal.close()
         except Exception as e:
             logger_mp.error(f"portal close failed: {e}")
-        if img_client is not None:
+        if bgr_source is not None:
             try:
-                img_client.close()
+                bgr_source.stop()
             except Exception as e:
-                logger_mp.error(f"ImageClient close failed: {e}")
+                logger_mp.error(f"BGR source close failed: {e}")
         logger_mp.info("robot exited.")

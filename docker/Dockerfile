@@ -5,6 +5,9 @@
 
 ARG PORTAL_REF=4fb4385f3e4bfc8e5019abce64be9042d338166e
 ARG UNITREE_SDK2_REF=65691c8a8bc53b98d3976dba4dbf9d5d20b2e7f5
+ARG TELEIMAGER_REF=57cf2a40572227273fa001cd17833b755331ec97
+ARG TELEVUER_REF=766de45e74373ae0ea66321d942ce538385655a5
+ARG DEX_RETARGETING_REF=d7753d38c9ff11f80bafea6cd168351fd3db9b0e
 
 # ----- livekit-portal wheel (Python 3.10 + Rust FFI) -----
 FROM python:3.10-bookworm AS portal-build
@@ -80,16 +83,24 @@ CMD ["python", "portal_robot_mock.py"]
 # setup.py has no package_data for utils/lib/*.so; pip install git+… drops crc_*.so.
 FROM base AS robot
 ARG UNITREE_SDK2_REF
-RUN apt-get update && apt-get install -y --no-install-recommends git \
+ARG TELEIMAGER_REF
+RUN apt-get update && apt-get install -y --no-install-recommends git cmake build-essential \
+    && git clone --branch releases/0.10.x https://github.com/eclipse-cyclonedds/cyclonedds.git /tmp/cyclonedds \
+    && mkdir /tmp/cyclonedds/build && cd /tmp/cyclonedds/build \
+    && cmake -DCMAKE_INSTALL_PREFIX=/usr/local .. \
+    && make -j$(nproc) install \
     && git clone https://github.com/unitreerobotics/unitree_sdk2_python.git /tmp/unitree_sdk2_python \
     && git -C /tmp/unitree_sdk2_python checkout "${UNITREE_SDK2_REF}" \
     && pip install --no-cache-dir --no-deps /tmp/unitree_sdk2_python \
-    && pip install --no-cache-dir \
+    && env CYCLONEDDS_HOME=/usr/local pip install --no-cache-dir \
         "cyclonedds==0.10.2" \
         "opencv-python-headless>=4.8,<4.11" \
         "numpy<2.0.0" \
         pyzmq \
-    && pip install --no-cache-dir --no-deps /app/teleop/teleimager \
+    && rm -rf /app/teleop/teleimager \
+    && git clone https://github.com/unitreerobotics/teleimager.git /tmp/teleimager \
+    && git -C /tmp/teleimager checkout "${TELEIMAGER_REF}" \
+    && pip install --no-cache-dir --no-deps /tmp/teleimager \
     && python -c "\
 import os, shutil, unitree_sdk2py.utils.crc as crc; \
 src = '/tmp/unitree_sdk2_python/unitree_sdk2py/utils/lib'; \
@@ -98,8 +109,8 @@ os.makedirs(dst, exist_ok=True); \
 shutil.copytree(src, dst, dirs_exist_ok=True)" \
     && python -c "from unitree_sdk2py.utils.crc import CRC; CRC()" \
     && python -c "from teleimager.image_client import ImageClient" \
-    && rm -rf /tmp/unitree_sdk2_python /root/.cache/pip \
-    && apt-get purge -y git \
+    && rm -rf /tmp/unitree_sdk2_python /tmp/cyclonedds /tmp/teleimager /root/.cache/pip \
+    && apt-get purge -y git cmake build-essential \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 CMD ["python", "teleop_robot.py", "--ee", "dex3", "--arm", "G1_29"]
@@ -111,6 +122,9 @@ CMD ["python", "teleop_robot.py", "--ee", "dex3", "--arm", "G1_29"]
 #   pip install -e teleop/robot_control/dex-retargeting
 #   pip install -r requirements.txt
 FROM debian:bookworm-slim AS operator
+ARG TELEIMAGER_REF
+ARG TELEVUER_REF
+ARG DEX_RETARGETING_REF
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -124,6 +138,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         bzip2 \
+        git \
         libgl1 \
         libglib2.0-0 \
         libgomp1 \
@@ -150,9 +165,15 @@ COPY requirements.txt /app/requirements.txt
 COPY assets/g1 /app/assets/g1
 COPY assets/unitree_hand /app/assets/unitree_hand
 
-# README pip, then Portal extras (not in upstream README). dex-retargeting
-# may pip-install pin; restore conda pinocchio so pinocchio.casadi stays.
-RUN pip install --no-cache-dir -e /app/teleop/teleimager --no-deps \
+# Empty submodule dirs in the build context; clone the Superproject gitlink SHAs.
+RUN rm -rf /app/teleop/teleimager /app/teleop/televuer /app/teleop/robot_control/dex-retargeting \
+    && git clone https://github.com/unitreerobotics/teleimager.git /app/teleop/teleimager \
+    && git -C /app/teleop/teleimager checkout "${TELEIMAGER_REF}" \
+    && git clone https://github.com/unitreerobotics/televuer.git /app/teleop/televuer \
+    && git -C /app/teleop/televuer checkout "${TELEVUER_REF}" \
+    && git clone https://github.com/silencht/dex-retargeting.git /app/teleop/robot_control/dex-retargeting \
+    && git -C /app/teleop/robot_control/dex-retargeting checkout "${DEX_RETARGETING_REF}" \
+    && pip install --no-cache-dir -e /app/teleop/teleimager --no-deps \
     && pip install --no-cache-dir -e /app/teleop/televuer \
     && pip install --no-cache-dir -e /app/teleop/robot_control/dex-retargeting \
     && pip install --no-cache-dir -r /app/requirements.txt \

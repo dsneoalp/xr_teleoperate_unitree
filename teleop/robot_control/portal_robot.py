@@ -23,7 +23,34 @@ if parent2_dir not in sys.path:
     sys.path.append(parent2_dir)
 
 from teleop.robot_control.portal_mapping import PortalMapping
-from teleop.robot_control.portal_operator import mint_portal_token, _load_dotenv
+from teleop.robot_control.portal_operator import _load_dotenv
+
+
+def _mint_robot_token(api_key: str, api_secret: str, identity: str, room: str,
+                      ttl_hours: int = 12) -> str:
+    """Same grants as SAG_Robot_Service/services/portal_robot/token.py.
+
+    No RoomConfiguration playout-delay (that belongs on the operator JWT).
+    """
+    import datetime
+    from livekit import api
+
+    grants = api.VideoGrants(
+        room_join=True,
+        room=room,
+        can_publish=True,
+        can_subscribe=True,
+        can_publish_data=True,
+        can_update_own_metadata=True,
+    )
+    return (
+        api.AccessToken(api_key, api_secret)
+        .with_identity(identity)
+        .with_name(identity)
+        .with_ttl(datetime.timedelta(hours=ttl_hours))
+        .with_grants(grants)
+        .to_jwt()
+    )
 
 
 class PortalRobotTransport:
@@ -114,7 +141,7 @@ class PortalRobotTransport:
                 pass
 
     async def _async_main(self):
-        token = mint_portal_token(
+        token = _mint_robot_token(
             os.environ["LIVEKIT_API_KEY"], os.environ["LIVEKIT_API_SECRET"],
             self._identity, self._room)
         await self._robot.connect(self._url, token)
