@@ -82,13 +82,16 @@ if __name__ == '__main__':
             with lock:
                 action = latest['action']
                 n = latest['count']
+            ts_us = int(now * 1_000_000)
             if action is not None:
-                portal.send_state(arm_q=action.arm_q, hand_q=action.hand_q, fsm_id=action.fsm_id)
+                portal.send_state(
+                    arm_q=action.arm_q, hand_q=action.hand_q, fsm_id=action.fsm_id,
+                    timestamp_us=ts_us)
             else:
-                portal.send_state(fsm_id=0)
+                portal.send_state(fsm_id=0, timestamp_us=ts_us)
             if track:
                 rgb = _test_pattern(480, 640, now - t0)
-                portal.send_video_frame(track, rgb, timestamp_us=int(now * 1_000_000))
+                portal.send_video_frame(track, rgb, timestamp_us=ts_us)
             if now - last_log >= 1.0:
                 rate = n - last_count
                 last_count = n

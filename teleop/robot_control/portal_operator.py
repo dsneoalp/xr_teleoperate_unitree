@@ -4,13 +4,14 @@ Used by teleop_operator.py (not as arm_ctrl):
 
   * IK arm targets, dex3 retargeting, and loco (vx/vy/vyaw) are published
     as Portal actions at the teleop control rate.
-  * Robot state is received via on_observation (joints only; video is
-    decoded on on_video_frame). IK warm-starts from last sent targets so
-    delayed WAN state does not oscillate the solver. Missing state still
-    dead-reckons with those targets.
-  * Video: every track listed under portal.yaml `videos:` is subscribed.
-    TeleVuer / get_head_frame() shows the first entry; extra tracks map
-    to left/right wrist in declaration order.
+  * Control state is received via on_state (no video wait). IK warm-starts
+    from last sent targets so delayed WAN state does not oscillate the
+    solver. Missing state still dead-reckons with those targets.
+  * Video: on_video_frame copies raw RGB; TeleVuer / get_head_frame()
+    decodes on the caller thread. Extra tracks map to left/right wrist
+    in declaration order.
+  * Recordings consume on_observation (state + matched frames) and join
+    actions via in_reply_to_ts_us.
 
 No unitree_sdk2py import happens anywhere in this module.
 Joint names come from portal_mapping.yaml, not hardcoded tuples.
@@ -23,6 +24,9 @@ import sys
 import time
 import asyncio
 import threading
+from collections import deque
+from dataclasses import dataclass
+from queue import Empty, Full, Queue
 
 import numpy as np
 import yaml
@@ -40,6 +44,8 @@ from teleop.robot_control.portal_mapping import PortalMapping
 
 # ImageClient / TeleVuer slot names. Portal tracks bind by yaml order.
 _TELEVUER_SLOTS = ("head_camera", "left_wrist_camera", "right_wrist_camera")
+_ACTION_RING = 64
+_RECORD_QUEUE = 8
 
 
 class _Frame:
@@ -50,6 +56,26 @@ class _Frame:
     def __init__(self, bgr, timestamp_us=0):
         self.bgr = bgr
         self.timestamp_us = timestamp_us
+
+
+@dataclass
+class _RawFrame:
+    rgb: bytes
+    width: int
+    height: int
+    timestamp_us: int
+
+
+@dataclass
+class _SentAction:
+    timestamp_us: int
+    in_reply_to_ts_us: int | None
+    arm_q: np.ndarray
+    hand_q: np.ndarray
+    vx: float
+    vy: float
+    vyaw: float
+    fsm_id: int
 
 
 def _load_dotenv(env_file: str) -> None:
@@ -177,8 +203,9 @@ class PortalTeleopBridge:
 
         cfg = OperatorConfig.from_yaml_file(portal_yaml, self._room)
         self._op = Operator(cfg)
+        self._op.on_state(self._on_state)
         self._op.on_observation(self._on_observation)
-        self._op.on_drop(lambda drops: logger_mp.debug(f"[portal] dropped states: {len(drops)}"))
+        self._op.on_drop(self._on_drop)
         for track in self._declared_videos:
             self._op.on_video_frame(track, self._on_video_frame)
         self._frames_logged = set()
@@ -193,9 +220,14 @@ class PortalTeleopBridge:
         self._prev_state_q = None
         self._prev_state_ts_us = None
         self._obs_ts_us = None
-        self._frames = {}
+        self._raw_frames: dict[str, _RawFrame] = {}
+        self._decoded_bgr: dict[str, _Frame] = {}
+        self._decoded_src: dict[str, int] = {}
         self._pending_action_wall = None
         self._rtt_cb = None
+        self._drop_cb = None
+        self._drop_count = 0
+        self._drop_log_t = 0.0
 
         self._arm_lock = threading.Lock()
         self._q_target = np.zeros(arm_dof)
@@ -209,6 +241,15 @@ class PortalTeleopBridge:
         self._vx = 0.0
         self._vy = 0.0
         self._vyaw = 0.0
+
+        self._action_lock = threading.Lock()
+        self._action_ring: deque[_SentAction] = deque(maxlen=_ACTION_RING)
+
+        self._recording = threading.Event()
+        self._record_cb = None
+        self._record_binocular = False
+        self._record_loco = False
+        self._record_q: Queue = Queue(maxsize=_RECORD_QUEUE)
 
         self._stop_evt = threading.Event()
         self._connected_evt = threading.Event()
@@ -226,6 +267,9 @@ class PortalTeleopBridge:
             self._hand_fps = hand_fps
             self._hand_thread = threading.Thread(target=self._hand_retarget_loop, daemon=True)
             self._hand_thread.start()
+
+        self._record_thread = threading.Thread(target=self._record_loop, daemon=True)
+        self._record_thread.start()
 
         self._portal_thread = threading.Thread(target=self._portal_loop, daemon=True)
         self._portal_thread.start()
@@ -269,12 +313,16 @@ class PortalTeleopBridge:
             msg = self._connect_error or "timeout"
             raise RuntimeError(f"[portal] operator failed to connect: {msg}")
 
-    def _on_observation(self, obs) -> None:
-        ts_us = getattr(obs, "timestamp_us", None)
-        wall = time.time()
-        raw = getattr(obs, "raw_state", None)
+    def _state_dict(self, msg) -> dict:
+        raw = getattr(msg, "raw_state", None)
         if not raw:
-            raw = getattr(obs, "state", None) or {}
+            raw = getattr(msg, "state", None) or {}
+        return raw
+
+    def _on_state(self, state) -> None:
+        ts_us = getattr(state, "timestamp_us", None)
+        wall = time.time()
+        raw = self._state_dict(state)
         q_new = self._map.unpack_arm_q(raw)
         hand_new = self._map.unpack_hand_q(raw)
 
@@ -303,12 +351,78 @@ class PortalTeleopBridge:
                 n = min(len(self._dual_hand_state_array_out), hand_new.size)
                 self._dual_hand_state_array_out[:n] = hand_new[:n]
 
+    def _on_drop(self, dropped) -> None:
+        n = len(dropped) if dropped else 0
+        if n <= 0:
+            return
+        self._drop_count += n
+        if self._drop_cb is not None:
+            try:
+                self._drop_cb(n)
+            except Exception as exc:
+                logger_mp.debug(f"[portal] drop callback failed: {exc}")
+        now = time.monotonic()
+        if now - self._drop_log_t >= 1.0:
+            logger_mp.info(f"[portal] dropped states n={n} total={self._drop_count}")
+            self._drop_log_t = now
+
+    def _on_observation(self, obs) -> None:
+        if not self._recording.is_set() or self._record_cb is None:
+            return
+        ts_us = getattr(obs, "timestamp_us", None)
+        raw = self._state_dict(obs)
+        frames = getattr(obs, "frames", None) or {}
+        copied = {}
+        for name, frame in frames.items():
+            raw_f = self._copy_raw_frame(frame)
+            if raw_f is not None:
+                copied[name] = raw_f
+        sample = {
+            "ts_us": ts_us,
+            "raw_state": dict(raw) if raw else {},
+            "frames": copied,
+            "action": self._match_action(ts_us),
+        }
+        try:
+            self._record_q.put_nowait(sample)
+        except Full:
+            try:
+                self._record_q.get_nowait()
+                self._record_q.task_done()
+            except (Empty, ValueError):
+                pass
+            try:
+                self._record_q.put_nowait(sample)
+            except Full:
+                logger_mp.warning("[portal] record queue full, dropping observation")
+
+    def _copy_raw_frame(self, frame) -> _RawFrame | None:
+        try:
+            data = getattr(frame, "data", None)
+            w, h = int(getattr(frame, "width", 0) or 0), int(getattr(frame, "height", 0) or 0)
+            if data is None or not w or not h:
+                return None
+            return _RawFrame(
+                rgb=bytes(data),
+                width=w,
+                height=h,
+                timestamp_us=int(getattr(frame, "timestamp_us", 0) or 0),
+            )
+        except Exception as exc:
+            logger_mp.warning(f"[portal] failed to copy video frame: {exc}")
+            return None
+
     def _on_video_frame(self, track: str, frame) -> None:
-        stored = self._decode_video_frame(track, frame)
-        if not stored:
+        raw = self._copy_raw_frame(frame)
+        if raw is None:
             return
         with self._obs_lock:
-            self._frames.update(stored)
+            self._raw_frames[track] = raw
+        if track not in self._frames_logged:
+            self._frames_logged.add(track)
+            slot = self._slot_for_track(track)
+            dest = "TeleVuer" if track == self._xr_track else (slot or "record")
+            logger_mp.info(f"[portal] video '{track}' {raw.width}x{raw.height} → {dest}")
 
     def _slot_for_track(self, track: str) -> str | None:
         try:
@@ -319,29 +433,132 @@ class PortalTeleopBridge:
             return None
         return _TELEVUER_SLOTS[idx]
 
-    def _decode_video_frame(self, track: str, frame) -> dict:
-        try:
-            data = frame.data
-            w, h = int(frame.width), int(frame.height)
-            if data is None or not w or not h:
-                return {}
-            rgb = np.frombuffer(bytes(data), dtype=np.uint8).reshape(h, w, 3)
-            bgr = np.ascontiguousarray(rgb[:, :, ::-1])
+    def _bgr_from_raw(self, raw: _RawFrame, slot: str | None) -> np.ndarray:
+        rgb = np.frombuffer(raw.rgb, dtype=np.uint8).reshape(raw.height, raw.width, 3)
+        bgr = np.ascontiguousarray(rgb[:, :, ::-1])
+        if slot and slot in self._expected_hw:
+            eh, ew = self._expected_hw[slot]
+            if (raw.height, raw.width) != (eh, ew):
+                import cv2
+                bgr = cv2.resize(bgr, (ew, eh), interpolation=cv2.INTER_LINEAR)
+        return bgr
+
+    def _match_action(self, state_ts_us) -> _SentAction | None:
+        with self._action_lock:
+            if not self._action_ring:
+                return None
+            if state_ts_us is not None:
+                for item in reversed(self._action_ring):
+                    if item.in_reply_to_ts_us is not None and item.in_reply_to_ts_us == state_ts_us:
+                        return item
+            return min(
+                self._action_ring,
+                key=lambda a: abs((a.timestamp_us or 0) - (state_ts_us or 0)),
+            )
+
+    def _record_loop(self) -> None:
+        while not self._stop_evt.is_set():
+            try:
+                sample = self._record_q.get(timeout=0.2)
+            except Empty:
+                continue
+            try:
+                item = self._build_record_item(sample)
+                cb = self._record_cb
+                if item is not None and cb is not None:
+                    cb(item)
+            except Exception as exc:
+                logger_mp.warning(f"[portal] record sample failed: {exc}")
+            finally:
+                try:
+                    self._record_q.task_done()
+                except ValueError:
+                    pass
+
+    def _build_record_item(self, sample: dict) -> dict | None:
+        raw_state = sample.get("raw_state") or {}
+        arm_q = self._map.unpack_arm_q(raw_state)
+        hand_q = self._map.unpack_hand_q(raw_state)
+        if arm_q is None:
+            arm_q = np.zeros(self._map.arm_dof)
+        if hand_q is None:
+            hand_q = np.zeros(self._map.hand_dof)
+        n_left_arm = len(self._map.left_arm)
+        n_left_hand = len(self._map.left_hand)
+        left_arm_state = arm_q[:n_left_arm]
+        right_arm_state = arm_q[n_left_arm:]
+        left_ee_state = hand_q[:n_left_hand].tolist()
+        right_ee_state = hand_q[n_left_hand:].tolist()
+
+        action = sample.get("action")
+        if action is not None:
+            left_arm_action = action.arm_q[:n_left_arm]
+            right_arm_action = action.arm_q[n_left_arm:]
+            left_hand_action = action.hand_q[:n_left_hand].tolist()
+            right_hand_action = action.hand_q[n_left_hand:].tolist()
+            body_action = [action.vx, action.vy, action.vyaw] if self._record_loco else []
+        else:
+            left_arm_action = np.zeros(n_left_arm)
+            right_arm_action = np.zeros(len(self._map.right_arm))
+            left_hand_action = [0.0] * n_left_hand
+            right_hand_action = [0.0] * len(self._map.right_hand)
+            body_action = []
+
+        colors = self._colors_from_raw(sample.get("frames") or {})
+        return {
+            "colors": colors,
+            "depths": {},
+            "states": {
+                "left_arm": {"qpos": left_arm_state.tolist(), "qvel": [], "torque": []},
+                "right_arm": {"qpos": right_arm_state.tolist(), "qvel": [], "torque": []},
+                "left_ee": {"qpos": left_ee_state, "qvel": [], "torque": []},
+                "right_ee": {"qpos": right_ee_state, "qvel": [], "torque": []},
+                "body": {"qpos": []},
+            },
+            "actions": {
+                "left_arm": {"qpos": left_arm_action.tolist(), "qvel": [], "torque": []},
+                "right_arm": {"qpos": right_arm_action.tolist(), "qvel": [], "torque": []},
+                "left_ee": {"qpos": left_hand_action, "qvel": [], "torque": []},
+                "right_ee": {"qpos": right_hand_action, "qvel": [], "torque": []},
+                "body": {"qpos": body_action},
+            },
+        }
+
+    def _colors_from_raw(self, frames: dict[str, _RawFrame]) -> dict:
+        colors = {}
+        binocular = self._record_binocular
+        for i, track in enumerate(self._declared_videos):
+            raw = frames.get(track)
+            if raw is None:
+                continue
             slot = self._slot_for_track(track)
-            if slot and slot in self._expected_hw:
-                eh, ew = self._expected_hw[slot]
-                if (h, w) != (eh, ew):
-                    import cv2
-                    bgr = cv2.resize(bgr, (ew, eh), interpolation=cv2.INTER_LINEAR)
-            wrapped = _Frame(bgr, getattr(frame, "timestamp_us", 0) or 0)
-            if track not in self._frames_logged:
-                self._frames_logged.add(track)
-                dest = "TeleVuer" if track == self._xr_track else (slot or "record")
-                logger_mp.info(f"[portal] video '{track}' {w}x{h} → {dest}")
-            return {track: wrapped}
-        except Exception as exc:
-            logger_mp.warning(f"[portal] failed to decode frame '{track}': {exc}")
-            return {}
+            bgr = self._bgr_from_raw(raw, slot)
+            if i == 0:
+                if binocular and bgr.shape[1] >= 2:
+                    w = bgr.shape[1] // 2
+                    colors["color_0"] = bgr[:, :w]
+                    colors["color_1"] = bgr[:, w:]
+                else:
+                    colors["color_0"] = bgr
+            elif i == 1:
+                colors["color_2" if binocular else "color_1"] = bgr
+            elif i == 2:
+                colors["color_3" if binocular else "color_2"] = bgr
+        return colors
+
+    def configure_recording(self, *, binocular: bool, record_loco: bool, on_sample) -> None:
+        self._record_binocular = bool(binocular)
+        self._record_loco = bool(record_loco)
+        self._record_cb = on_sample
+
+    def start_recording(self) -> None:
+        self._recording.set()
+
+    def stop_recording(self, timeout: float = 2.0) -> None:
+        self._recording.clear()
+        deadline = time.time() + timeout
+        while not self._record_q.empty() and time.time() < deadline:
+            time.sleep(0.02)
 
     def send_targets(self, arm_q, hand_q=None, vx=0.0, vy=0.0, vyaw=0.0, fsm_id=None) -> None:
         """Publish one action: arm (+ optional hand) targets and loco."""
@@ -371,13 +588,22 @@ class PortalTeleopBridge:
             in_reply_to = self._obs_ts_us
         values = self._map.pack_action(
             arm_q=q_arm, hand_q=hand_q, vx=vx, vy=vy, vyaw=vyaw, fsm_id=fsm_id)
+        ts_us = int(time.time() * 1_000_000)
         try:
             self._op.send_action(values,
-                                 timestamp_us=int(time.time() * 1_000_000),
+                                 timestamp_us=ts_us,
                                  in_reply_to_ts_us=in_reply_to)
         except Exception as exc:
             logger_mp.warning(f"[portal] send_action failed: {exc}")
             return
+        with self._action_lock:
+            self._action_ring.append(_SentAction(
+                timestamp_us=ts_us,
+                in_reply_to_ts_us=in_reply_to,
+                arm_q=np.asarray(q_arm, dtype=np.float64).copy(),
+                hand_q=hand_q,
+                vx=vx, vy=vy, vyaw=vyaw, fsm_id=fsm_id,
+            ))
         with self._obs_lock:
             self._pending_action_wall = time.time()
         now = time.time()
@@ -390,8 +616,12 @@ class PortalTeleopBridge:
             self._last_send_wall = now
 
     def on_rtt(self, callback) -> None:
-        """callback(rtt_ms) on the first observation after a successful send_action."""
+        """callback(rtt_ms) on the first state after a successful send_action."""
         self._rtt_cb = callback
+
+    def on_drops(self, callback) -> None:
+        """callback(n) when Portal drops unmatched observation states."""
+        self._drop_cb = callback
 
     def state_age_ms(self) -> float | None:
         with self._obs_lock:
@@ -513,8 +743,24 @@ class PortalTeleopBridge:
             return _Frame(None)
         track = self._declared_videos[index]
         with self._obs_lock:
-            frame = self._frames.get(track)
-            return frame if frame is not None else _Frame(None)
+            raw = self._raw_frames.get(track)
+            if raw is None:
+                return _Frame(None)
+            src_id = id(raw)
+            cached = self._decoded_bgr.get(track)
+            if cached is not None and self._decoded_src.get(track) == src_id:
+                return cached
+        slot = self._slot_for_track(track)
+        try:
+            wrapped = _Frame(self._bgr_from_raw(raw, slot), raw.timestamp_us)
+        except Exception as exc:
+            logger_mp.warning(f"[portal] failed to decode frame '{track}': {exc}")
+            return _Frame(None)
+        with self._obs_lock:
+            if self._raw_frames.get(track) is raw:
+                self._decoded_bgr[track] = wrapped
+                self._decoded_src[track] = src_id
+        return wrapped
 
     def get_head_frame(self):
         return self._get_frame_at(0)
@@ -527,9 +773,12 @@ class PortalTeleopBridge:
 
     def close(self) -> None:
         logger_mp.info("[portal] closing bridge ...")
+        self._recording.clear()
         self._stop_evt.set()
         if self._hand_thread is not None:
             self._hand_thread.join(timeout=3.0)
+        if self._record_thread is not None:
+            self._record_thread.join(timeout=2.0)
         if self._portal_thread is not None:
             self._portal_thread.join(timeout=5.0)
         logger_mp.info("[portal] bridge closed.")

@@ -60,5 +60,9 @@ class LoopTiming:
         if den:
             hz = den / elapsed if elapsed > 0 else 0.0
             parts.append(f"stale_frac={num / den:.2f} hz={hz:.1f}")
+        for name in sorted(counts):
+            if name in ("stale", "loops"):
+                continue
+            parts.append(f"{name}={counts[name]}")
         if parts:
             self._log.info(f"{self._prefix} " + " | ".join(parts))

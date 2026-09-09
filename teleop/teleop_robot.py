@@ -90,7 +90,36 @@ def _connect_image_client(host: str):
     return None
 
 
-def _video_publish_loop(img_client, portal, track, stop_evt, fps: float):
+class CaptureClock:
+    """Shared wall-clock stamps so Portal can match state and video."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._video_us = 0
+        self._last_state_us = 0
+
+    def now_us(self) -> int:
+        return int(time.time() * 1_000_000)
+
+    def mark_video(self, ts_us: int) -> None:
+        with self._lock:
+            self._video_us = ts_us
+
+    def state_us(self) -> int:
+        now = self.now_us()
+        with self._lock:
+            video_us = self._video_us
+            if video_us and abs(now - video_us) < 50_000:
+                ts = max(now, video_us)
+            else:
+                ts = now
+            if ts <= self._last_state_us:
+                ts = self._last_state_us + 1
+            self._last_state_us = ts
+            return ts
+
+
+def _video_publish_loop(img_client, portal, track, stop_evt, fps: float, clock: CaptureClock):
     """Grab latest ZMQ frame and publish off the control loop. Drop-oldest: no queue."""
     logged = False
     interval = 1.0 / max(fps, 1.0)
@@ -99,9 +128,10 @@ def _video_publish_loop(img_client, portal, track, stop_evt, fps: float):
         try:
             head = img_client.get_head_frame()
             if head is not None and getattr(head, "bgr", None) is not None:
+                ts_us = clock.now_us()
                 rgb = np.ascontiguousarray(head.bgr[:, :, ::-1])
-                portal.send_video_frame(
-                    track, rgb, timestamp_us=int(time.time() * 1_000_000))
+                portal.send_video_frame(track, rgb, timestamp_us=ts_us)
+                clock.mark_video(ts_us)
                 if not logged:
                     h, w = rgb.shape[:2]
                     logger_mp.info(f"publishing '{track}' {w}x{h} (video thread)")
@@ -115,7 +145,7 @@ def _video_publish_loop(img_client, portal, track, stop_evt, fps: float):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--frequency', type=float, default=30.0, help='state publish rate')
+    parser.add_argument('--frequency', type=float, default=60.0, help='state publish rate')
     parser.add_argument('--arm', type=str, choices=['G1_29'], default='G1_29')
     parser.add_argument('--ee', type=str, choices=['dex3'], default=None)
     parser.add_argument('--motion', action='store_true')
@@ -166,6 +196,7 @@ if __name__ == '__main__':
         url=args.livekit_url)
     portal.wait_until_connected()
 
+    capture_clock = CaptureClock()
     img_client = None if args.no_img else _connect_image_client(args.img_server_ip)
     video_track = portal.video_tracks[0] if portal.video_tracks else None
     video_stop = threading.Event()
@@ -173,7 +204,7 @@ if __name__ == '__main__':
     if img_client is not None and video_track:
         video_thread = threading.Thread(
             target=_video_publish_loop,
-            args=(img_client, portal, video_track, video_stop, args.frequency),
+            args=(img_client, portal, video_track, video_stop, args.frequency, capture_clock),
             daemon=True)
         video_thread.start()
         logger_mp.info("video publish thread started")
@@ -231,7 +262,8 @@ if __name__ == '__main__':
                         hand_cmd['q'] = np.asarray(hand_ctrl.get_current_dual_hand_q(), dtype=float).copy()
                 if hand_ctrl is not None and action.hand_q.size:
                     half = action.hand_q.size // 2
-                    hand_q = interp_cmd(hand_cmd, action.hand_q, start, args.cmd_tau)
+                    hand_q = action.hand_q
+                    #hand_q = interp_cmd(hand_cmd, action.hand_q, start, args.cmd_tau)
                     hand_ctrl.ctrl_dual_hand(hand_q[:half], hand_q[half:])
                 applied_fsm = FSM_HAND_SETUP
             elif fsm == FSM_TELEOP and action:
@@ -243,8 +275,10 @@ if __name__ == '__main__':
                     if hand_ctrl is not None:
                         hand_cmd['q'] = np.asarray(hand_ctrl.get_current_dual_hand_q(), dtype=float).copy()
                 tauff = np.zeros_like(action.arm_q)
+                
                 # pick one (arm + hand must match):
-                arm_q = interp_cmd(arm_cmd, action.arm_q, start, args.cmd_tau)
+                arm_q = action.arm_q
+                #arm_q = interp_cmd(arm_cmd, action.arm_q, start, args.cmd_tau)
                 # arm_q = filter_cmd(arm_cmd, action.arm_q, dt, args.cmd_tau)
                 arm_ctrl.ctrl_dual_arm(arm_q, tauff)
                 if hand_ctrl is not None and action.hand_q.size:
@@ -262,7 +296,9 @@ if __name__ == '__main__':
 
             motor_q = arm_ctrl.get_current_motor_q()
             hand_q = hand_ctrl.get_current_dual_hand_q() if hand_ctrl is not None else None
-            portal.send_state(motor_q=motor_q, hand_q=hand_q, fsm_id=fsm)
+            portal.send_state(
+                motor_q=motor_q, hand_q=hand_q, fsm_id=fsm,
+                timestamp_us=capture_clock.state_us())
 
             sleep = max(0.0, (1.0 / args.frequency) - (time.time() - start))
             time.sleep(sleep)
