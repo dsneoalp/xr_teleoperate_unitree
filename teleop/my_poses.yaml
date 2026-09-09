@@ -1,0 +1,147 @@
+duration_s: 1.5
+default:
+  left_hand:
+    left_thumb_mcp: 0.0
+    left_thumb_aux: 0.0
+    left_thumb_pip: 0.0
+    left_index_mcp: 0.0
+    left_index_pip: 0.0
+    left_middle_mcp: 0.0
+    left_middle_pip: 0.0
+  right_hand:
+    right_thumb_mcp: 0.0
+    right_thumb_aux: 0.0
+    right_thumb_pip: 0.0
+    right_index_mcp: 0.0
+    right_index_pip: 0.0
+    right_middle_mcp: 0.0
+    right_middle_pip: 0.0
+bindings:
+- combo:
+  - L2
+  - X
+  left_hand:
+    left_thumb_mcp: 0.700126362
+    left_thumb_aux: 0.5535534081714285
+    left_thumb_pip: 0.68815839
+    left_index_mcp: -0.9335018130285714
+    left_index_pip: -1.26661037
+    left_middle_mcp: 0.0
+    left_middle_pip: 0.0
+- combo:
+  - L1
+  - X
+  left_hand:
+    left_thumb_mcp: -0.32911923
+    left_thumb_aux: 0.3468399461142858
+    left_thumb_pip: 1.00730431
+    left_index_mcp: 0.0
+    left_index_pip: 0.0
+    left_middle_mcp: -0.8616939812571428
+    left_middle_pip: -1.4162100199999998
+- combo:
+  - L1
+  - L2
+  - X
+  left_hand:
+    left_thumb_mcp: 0.04188790200000003
+    left_thumb_aux: 0.92
+    left_thumb_pip: 1.4162100199999998
+    left_index_mcp: -1.57079632
+    left_index_pip: -1.26661037
+    left_middle_mcp: -1.57079632
+    left_middle_pip: -1.3264502299999998
+- combo:
+  - X
+  left_hand:
+    left_thumb_mcp: 0.0
+    left_thumb_aux: 0.92
+    left_thumb_pip: 1.42618333
+    left_index_mcp: 0.0
+    left_index_pip: 0.0
+    left_middle_mcp: 0.0
+    left_middle_pip: 0.0
+- combo:
+  - L2
+  left_hand:
+    left_thumb_mcp: 0.0
+    left_thumb_aux: 0.0
+    left_thumb_pip: 0.0
+    left_index_mcp: -1.57079632
+    left_index_pip: -1.74532925
+    left_middle_mcp: 0.0
+    left_middle_pip: 0.0
+- combo:
+  - L1
+  left_hand:
+    left_thumb_mcp: 0.0
+    left_thumb_aux: 0.0
+    left_thumb_pip: 0.0
+    left_index_mcp: 0.0
+    left_index_pip: 0.0
+    left_middle_mcp: -1.57079632
+    left_middle_pip: -1.74532925
+- combo:
+  - R2
+  - B
+  right_hand:
+    right_thumb_mcp: 0.700126362
+    right_thumb_aux: -0.5535534081714285
+    right_thumb_pip: -0.68815839
+    right_index_mcp: 0.9335018130285714
+    right_index_pip: 1.26661037
+    right_middle_mcp: 0.0
+    right_middle_pip: 0.0
+- combo:
+  - R1
+  - B
+  right_hand:
+    right_thumb_mcp: -0.32911923
+    right_thumb_aux: -0.3468399461142858
+    right_thumb_pip: -1.00730431
+    right_index_mcp: 0.0
+    right_index_pip: 0.0
+    right_middle_mcp: 0.8616939812571428
+    right_middle_pip: 1.4162100199999998
+- combo:
+  - R1
+  - R2
+  - B
+  right_hand:
+    right_thumb_mcp: 0.0
+    right_thumb_aux: -0.92
+    right_thumb_pip: -1.4162100199999998
+    right_index_mcp: 1.57079632
+    right_index_pip: 1.26661037
+    right_middle_mcp: 1.57079632
+    right_middle_pip: 1.3264502299999998
+- combo:
+  - B
+  right_hand:
+    right_thumb_mcp: 0.0
+    right_thumb_aux: -0.92
+    right_thumb_pip: -1.42618333
+    right_index_mcp: 0.0
+    right_index_pip: 0.0
+    right_middle_mcp: 0.0
+    right_middle_pip: 0.0
+- combo:
+  - R2
+  right_hand:
+    right_thumb_mcp: 0.0
+    right_thumb_aux: 0.0
+    right_thumb_pip: 0.0
+    right_index_mcp: 1.57079632
+    right_index_pip: 1.74532925
+    right_middle_mcp: 0.0
+    right_middle_pip: 0.0
+- combo:
+  - R1
+  right_hand:
+    right_thumb_mcp: 0.0
+    right_thumb_aux: 0.0
+    right_thumb_pip: 0.0
+    right_index_mcp: 0.0
+    right_index_pip: 0.0
+    right_middle_mcp: 1.57079632
+    right_middle_pip: 1.74532925

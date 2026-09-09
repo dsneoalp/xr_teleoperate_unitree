@@ -29,6 +29,7 @@ from teleop.utils.loop_timing import LoopTiming
 FSM_IDLE = 0
 FSM_TELEOP = 1
 FSM_HOME = 2
+FSM_HAND_SETUP = 3
 ACTION_TIMEOUT = 0.2
 IMAGE_CLIENT_RETRIES = 50
 IMAGE_CLIENT_RETRY_S = 0.1
@@ -222,6 +223,17 @@ if __name__ == '__main__':
                     applied_fsm = FSM_HOME
                 arm_cmd.clear()
                 hand_cmd.clear()
+            elif fsm == FSM_HAND_SETUP and action:
+                if applied_fsm != FSM_HAND_SETUP:
+                    arm_cmd.clear()
+                    hand_cmd.clear()
+                    if hand_ctrl is not None:
+                        hand_cmd['q'] = np.asarray(hand_ctrl.get_current_dual_hand_q(), dtype=float).copy()
+                if hand_ctrl is not None and action.hand_q.size:
+                    half = action.hand_q.size // 2
+                    hand_q = interp_cmd(hand_cmd, action.hand_q, start, args.cmd_tau)
+                    hand_ctrl.ctrl_dual_hand(hand_q[:half], hand_q[half:])
+                applied_fsm = FSM_HAND_SETUP
             elif fsm == FSM_TELEOP and action:
                 if applied_fsm != FSM_TELEOP:
                     arm_ctrl.speed_gradual_max()

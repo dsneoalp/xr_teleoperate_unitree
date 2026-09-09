@@ -19,7 +19,7 @@ PyPI `livekit-portal` wheels are Python 3.12 only. The image stays on Python 3.1
 
 | Service | What it is |
 |---|---|
-| `operator` | README 1.1 conda env `tv`: `python=3.10 pinocchio=3.1.0 numpy=1.26.4` (conda-forge), then `pip install -e` teleimager / televuer / dex-retargeting, then `requirements.txt`. Plus `livekit-portal` built from git `4fb4385` (PyPI wheels are Python 3.12 only), `livekit-api`, and `params-proto==2.13.2` so `vuer==0.0.60` still imports. No Unitree SDK. |
+| `operator` | README 1.1 conda env `tv`: `python=3.10 pinocchio=3.1.0 numpy=1.26.4 tk` (conda-forge), then `pip install -e` teleimager / televuer / dex-retargeting, then `requirements.txt`. Plus `livekit-portal` built from git `4fb4385` (PyPI wheels are Python 3.12 only), `livekit-api`, and `params-proto==2.13.2` so `vuer==0.0.60` still imports. No Unitree SDK. Tkinter for `--custom_mapping` GUI. |
 | `robot` | README 1.2 `unitree_sdk2_python` at commit `65691c8` (`git+https` during build) + cyclonedds. DDS controllers. |
 | `mock` | LiveKit echo robot. Prints latest action at 1 Hz. No SDK, no Pinocchio. |
 
@@ -37,7 +37,14 @@ docker compose -f docker/compose.yml up mock
 docker compose -f docker/compose.yml run --rm -it operator
 # extra argparse after the service name replaces CMD, entrypoint stays:
 docker compose -f docker/compose.yml run --rm -it operator --headless --ipc
+
+# Dex3 custom pose GUI (WORKDIR is /app/teleop; YAML lands on the host bind-mount):
+xhost +local:docker
+docker compose -f docker/compose.yml run --rm -it -e DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix \
+  operator --ee dex3 --input-mode controller --custom_mapping --hand-pose-yaml my_poses.yaml
 ```
+
+If `my_poses.yaml` already exists, the operator loads it and skips the GUI. `--custom_mapping --headless` without that file exits with an error.
 
 `teleop/.env` is loaded at runtime (`env_file`). It is not copied into the image.
 

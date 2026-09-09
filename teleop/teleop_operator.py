@@ -5,6 +5,7 @@ No Unitree SDK. Pair with teleop_robot.py in the same LiveKit room.
     python teleop/teleop_operator.py --ee dex3 --arm G1_29 --input-mode hand
     python teleop/teleop_operator.py --ee dex3 --arm G1_29 --input-mode controller
     python teleop/teleop_operator.py --ee dex3 --arm G1_29 --input-mode controller --motion
+    python teleop/teleop_operator.py --ee dex3 --arm G1_29 --input-mode controller --custom_mapping --hand-pose-yaml teleop/my_poses.yaml
 """
 import time
 import argparse
@@ -28,11 +29,20 @@ from teleop.utils.ipc import IPC_Server
 from sshkeyboard import listen_keyboard, stop_listening
 from teleop.robot_control.portal_operator import PortalTeleopBridge
 from teleop.utils.loop_timing import LoopTiming
+from teleop.utils.dex3_pose_mapping import (
+    load,
+    pressed_from_tele_data,
+    ramp_step,
+    ramp_towards,
+    resolve_mapping_mode,
+    target_q,
+)
 
 LOCO_SCALE = 0.3
 FSM_IDLE = 0
 FSM_TELEOP = 1
 FSM_HOME = 2
+FSM_HAND_SETUP = 3
 
 # Dex3 hardware-order open/close poses (thumb only; index/middle stay open).
 # Left: thumb0, thumb1, thumb2, middle0, middle1, index0, index1
@@ -64,11 +74,15 @@ STOP = False
 READY = False
 RECORD_RUNNING = False
 RECORD_TOGGLE = False
+MAPPING_GUI_OPEN = False
 
 
 def on_press(key):
     global STOP, START, RECORD_TOGGLE
     if key == 'r':
+        if MAPPING_GUI_OPEN:
+            logger_mp.warning("Accept the pose GUI first, then press [r].")
+            return
         START = True
     elif key == 'q':
         START = False
@@ -100,6 +114,11 @@ if __name__ == '__main__':
                         help='Read vx/vy/vyaw from controller thumbsticks (robot must also use --motion)')
     parser.add_argument('--dex3-oc-duration', type=float, default=1.5,
                         help='Seconds for a full Dex3 open↔close ramp via left X/Y (controller mode only)')
+    parser.add_argument('--custom_mapping', action='store_true',
+                        help='Bind Dex3 poses to controller combos (requires --ee dex3 --input-mode controller)')
+    parser.add_argument('--hand-pose-yaml', type=str,
+                        default=os.path.join(current_dir, 'hand_pose_session.yaml'),
+                        help='YAML path for --custom_mapping (load if present, else GUI writes it)')
     parser.add_argument('--headless', action='store_true')
     parser.add_argument('--ipc', action='store_true')
     parser.add_argument('--record', action='store_true')
@@ -119,6 +138,14 @@ if __name__ == '__main__':
 
     if args.ee == "dex3" and args.input_mode == "controller" and args.dex3_oc_duration <= 0:
         parser.error("--dex3-oc-duration must be > 0.")
+    if args.custom_mapping:
+        if args.ee != "dex3" or args.input_mode != "controller":
+            parser.error("--custom_mapping requires --ee dex3 --input-mode controller")
+    mapping_mode = resolve_mapping_mode(args.custom_mapping, os.path.isfile(args.hand_pose_yaml))
+    if mapping_mode == "gui" and args.headless:
+        parser.error("--custom_mapping --headless requires an existing --hand-pose-yaml file")
+
+    custom_spec = None
 
     try:
         if args.ipc:
@@ -188,27 +215,93 @@ if __name__ == '__main__':
                 frequency=args.frequency,
                 rerun_log=not args.headless)
 
-        logger_mp.info("----------------------------------------------------------------")
-        logger_mp.info("Press [r] to start syncing the robot with your movements.")
-        if args.ee == "dex3" and args.input_mode == "controller":
-            logger_mp.info("Dex3 X/Y: left X=close, left Y=open, right A=e-stop "
-                           f"(duration={args.dex3_oc_duration}s).")
-        if args.motion:
-            logger_mp.info("Motion: thumbsticks send vx/vy/vyaw (robot must also use --motion).")
-        if args.record:
-            logger_mp.info("Press [s] to START or SAVE recording (toggle cycle).")
-        logger_mp.info("Press [q] to stop and exit the program.")
-        READY = True
-        teleop_bridge.set_fsm_id(FSM_IDLE)
-        while not START and not STOP:
-            time.sleep(0.033)
-            if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
-                head_img = teleop_bridge.get_head_frame()
-                if head_img.bgr is not None:
-                    tv_wrapper.render_to_xr(head_img.bgr)
+        if mapping_mode == "load":
+            custom_spec = load(args.hand_pose_yaml)
+            logger_mp.info(
+                f"Loaded Dex3 pose mapping from {args.hand_pose_yaml} "
+                f"({len(custom_spec.bindings)} bindings).")
+        elif mapping_mode == "gui":
+            from teleop.utils.dex3_pose_gui import run_dex3_pose_gui
+            from teleop.utils.dex3_pose_gui_state import Dex3PoseGUIState
+            from teleop.utils.dex3_pose_mapping import PoseSpec
 
-        logger_mp.info("start Tracking")
-        teleop_bridge.set_fsm_id(FSM_TELEOP)
+            logger_mp.info(
+                "Dex3 pose GUI: bind combos, Accept to write YAML, then press [r].")
+            try:
+                import tkinter  # noqa: F401
+            except ImportError:
+                logger_mp.error(
+                    "tkinter is required for --custom_mapping when the YAML file is missing. "
+                    "Install tk (conda-forge) or python3-tk.")
+                STOP = True
+            if not STOP:
+                gui_state = Dex3PoseGUIState(PoseSpec(duration_s=args.dex3_oc_duration))
+                gui_stop = threading.Event()
+                gui_thread = threading.Thread(
+                    target=run_dex3_pose_gui,
+                    kwargs={
+                        "state": gui_state,
+                        "output_path": args.hand_pose_yaml,
+                        "stop_event": gui_stop,
+                    },
+                    daemon=True)
+                MAPPING_GUI_OPEN = True
+                gui_thread.start()
+                hold_arm = np.zeros(14)
+                dt = 1.0 / args.frequency
+                while (not gui_state.accepted.is_set()
+                       and not gui_state.cancelled.is_set()
+                       and not STOP):
+                    tick = time.time()
+                    if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
+                        head_img = teleop_bridge.get_head_frame()
+                        if head_img.bgr is not None:
+                            tv_wrapper.render_to_xr(head_img.bgr)
+                    teleop_bridge.send_targets(
+                        hold_arm,
+                        hand_q=gui_state.get_q(),
+                        vx=0.0, vy=0.0, vyaw=0.0,
+                        fsm_id=FSM_HAND_SETUP)
+                    time.sleep(max(0.0, dt - (time.time() - tick)))
+                gui_stop.set()
+                MAPPING_GUI_OPEN = False
+                if STOP or not gui_state.accepted.is_set():
+                    logger_mp.info("Pose GUI cancelled; exiting.")
+                    STOP = True
+                else:
+                    custom_spec = load(args.hand_pose_yaml)
+                    START = False
+                    logger_mp.info(
+                        f"Wrote Dex3 pose mapping to {args.hand_pose_yaml} "
+                        f"({len(custom_spec.bindings)} bindings).")
+
+        if not STOP:
+            logger_mp.info("----------------------------------------------------------------")
+            logger_mp.info("Press [r] to start syncing the robot with your movements.")
+            if custom_spec is not None:
+                logger_mp.info(
+                    "Dex3 custom mapping: longest matching combo ramps to its pose; "
+                    f"release ramps to default (duration={args.dex3_oc_duration}s). Right A=e-stop.")
+            elif args.ee == "dex3" and args.input_mode == "controller":
+                logger_mp.info("Dex3 X/Y: left X=close, left Y=open, right A=e-stop "
+                               f"(duration={args.dex3_oc_duration}s).")
+            if args.motion:
+                logger_mp.info("Motion: thumbsticks send vx/vy/vyaw (robot must also use --motion).")
+            if args.record:
+                logger_mp.info("Press [s] to START or SAVE recording (toggle cycle).")
+            logger_mp.info("Press [q] to stop and exit the program.")
+            READY = True
+            teleop_bridge.set_fsm_id(FSM_IDLE)
+            while not START and not STOP:
+                time.sleep(0.033)
+                if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
+                    head_img = teleop_bridge.get_head_frame()
+                    if head_img.bgr is not None:
+                        tv_wrapper.render_to_xr(head_img.bgr)
+
+        if not STOP:
+            logger_mp.info("start Tracking")
+            teleop_bridge.set_fsm_id(FSM_TELEOP)
 
         timing = LoopTiming(logger_mp)
         teleop_bridge.on_rtt(lambda rtt_ms: timing.add("rtt_ms", rtt_ms))
@@ -219,7 +312,12 @@ if __name__ == '__main__':
         right_wrist_img = None
         dex3_oc_s = 0.0
         dex3_oc_ramp = 0.0
-        if args.ee == "dex3" and args.input_mode == "controller":
+        custom_current_q = None
+        custom_ramp = 0.0
+        if custom_spec is not None:
+            custom_current_q = list(custom_spec.default_q)
+            custom_ramp = ramp_step(args.dex3_oc_duration, args.frequency)
+        elif args.ee == "dex3" and args.input_mode == "controller":
             dex3_oc_ramp = 1.0 / (args.dex3_oc_duration * args.frequency)
 
         while not STOP:
@@ -253,12 +351,18 @@ if __name__ == '__main__':
                 with right_hand_pos_array.get_lock():
                     right_hand_pos_array[:] = tele_data.right_hand_pos.flatten()
             elif args.ee == "dex3" and args.input_mode == "controller":
-                dex3_oc_s = ramp_dex3_oc(
-                    dex3_oc_s,
-                    tele_data.left_ctrl_aButton,
-                    tele_data.left_ctrl_bButton,
-                    dex3_oc_ramp)
-                controller_hand_q = dex3_oc_hand_q(dex3_oc_s)
+                if custom_spec is not None:
+                    pressed = pressed_from_tele_data(tele_data)
+                    tgt = target_q(pressed, custom_spec)
+                    custom_current_q = ramp_towards(custom_current_q, tgt, custom_ramp)
+                    controller_hand_q = np.asarray(custom_current_q, dtype=float)
+                else:
+                    dex3_oc_s = ramp_dex3_oc(
+                        dex3_oc_s,
+                        tele_data.left_ctrl_aButton,
+                        tele_data.left_ctrl_bButton,
+                        dex3_oc_ramp)
+                    controller_hand_q = dex3_oc_hand_q(dex3_oc_s)
             with xr_motion_data_ready.get_lock():
                 xr_motion_data_ready.value = tele_data.motion_data_ready
 

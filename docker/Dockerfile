@@ -134,6 +134,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libx11-6 \
         libxfixes3 \
         libgbm1 \
+        libxft2 \
+        libxss1 \
+        libtk8.6 \
+        fonts-dejavu-core \
         openssl \
     && curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest \
         | tar -xvj -C /usr/local bin/micromamba \
@@ -141,6 +145,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python=3.10 \
         pinocchio=3.1.0 \
         numpy=1.26.4 \
+        tk \
     && micromamba clean -a -y \
     && rm -rf /var/lib/apt/lists/*
 

@@ -1,0 +1,30 @@
+duration_s: 1.5
+default:
+  left_hand:
+    left_thumb_mcp: 0.0
+    left_thumb_aux: 0.0
+    left_thumb_pip: 0.0
+    left_index_mcp: 0.0
+    left_index_pip: 0.0
+    left_middle_mcp: 0.0
+    left_middle_pip: 0.0
+  right_hand:
+    right_thumb_mcp: 0.0
+    right_thumb_aux: 0.0
+    right_thumb_pip: 0.0
+    right_index_mcp: 0.0
+    right_index_pip: 0.0
+    right_middle_mcp: 0.0
+    right_middle_pip: 0.0
+bindings:
+- combo:
+  - L2
+  - X
+  left_hand:
+    left_thumb_mcp: 0.0
+    left_thumb_aux: 0.9
+    left_thumb_pip: 0.43
+    left_index_mcp: 0.0
+    left_index_pip: 0.0
+    left_middle_mcp: 0.0
+    left_middle_pip: 0.0
