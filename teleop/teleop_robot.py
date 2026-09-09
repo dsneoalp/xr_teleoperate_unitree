@@ -143,7 +143,7 @@ if __name__ == '__main__':
 
     loco_wrapper = None
     if args.motion:
-        loco_wrapper = LocoClientWrapper()
+        loco_wrapper = LocoClientWrapper(robot_type="G1")
     else:
         motion_switcher = MotionSwitcher()
         status, result = motion_switcher.Enter_Debug_Mode()
@@ -210,12 +210,6 @@ if __name__ == '__main__':
                 age = start - latest['wall'] if latest['wall'] else 1e9
 
             fsm = action.fsm_id if action is not None else FSM_IDLE
-            # fresh = action is not None and age < ACTION_TIMEOUT
-            # timing.count("loops")
-            # if action is not None:
-            #     timing.add("age_ms", age * 1000.0)
-            # if not fresh:
-            #     timing.count("stale")
 
             if fsm == FSM_HOME:
                 if applied_fsm != FSM_HOME:
@@ -269,7 +263,15 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         logger_mp.info("KeyboardInterrupt, exiting ...")
     finally:
-
+        try:
+            if motion_switcher is not None:
+                motion_switcher.Exit_Debug_Mode()
+                logger_mp.info(f"Exit debug / SelectMode('ai'): status={status} result={result}")
+                _, mode = motion_switcher.msc.CheckMode()
+                logger_mp.info(f"CheckMode after exit: {mode}")
+                
+        except Exception as e:
+            logger_mp.error(f"Exit debug mode failed: {e}")
         try:
             portal.close()
         except Exception as e:

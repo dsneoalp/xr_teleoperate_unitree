@@ -31,10 +31,11 @@ class MotionSwitcher:
             return None, None
 
 class LocoClientWrapper:
-    def __init__(self):
-        self.client = LocoClient()
-        self.client.SetTimeout(0.0001)
-        self.client.Init()
+    def __init__(self, robot_type="G1"):
+        if robot_type == "H1":
+            from unitree_sdk2py.h1.loco.h1_loco_client import LocoClient
+        else:
+            from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
 
     def Enter_Damp_Mode(self):
         self.client.Damp()

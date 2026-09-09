@@ -292,6 +292,7 @@ if __name__ == '__main__':
             logger_mp.info("Press [q] to stop and exit the program.")
             READY = True
             teleop_bridge.set_fsm_id(FSM_IDLE)
+            teleop_bridge.send_go_home()
             while not START and not STOP:
                 time.sleep(0.033)
                 if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
