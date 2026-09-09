@@ -38,6 +38,9 @@ from teleop.utils.dex3_pose_mapping import (
     target_q,
 )
 
+
+# Constants
+
 LOCO_SCALE = 0.3
 FSM_IDLE = 0
 FSM_TELEOP = 1
@@ -52,7 +55,15 @@ DEX3_CLOSED_Q_LEFT = np.array([0.25, 0.78, 1.48, 0.0, 0.0, 0.0, 0.0])
 DEX3_OPEN_Q_RIGHT = np.zeros(7)
 DEX3_CLOSED_Q_RIGHT = np.array([-0.25, -0.78, -1.48, 0.0, 0.0, 0.0, 0.0])
 
+# Global variables
+START = False
+STOP = False
+READY = False
+RECORD_RUNNING = False
+RECORD_TOGGLE = False
+MAPPING_GUI_OPEN = False
 
+# This should be moved to robot_hand_unitree.py
 def ramp_dex3_oc(s, close_pressed, open_pressed, ramp):
     """Update open/close scalar in [0, 1]. X (close) wins if both are held."""
     if close_pressed:
@@ -61,7 +72,6 @@ def ramp_dex3_oc(s, close_pressed, open_pressed, ramp):
         return max(0.0, s - ramp)
     return s
 
-
 def dex3_oc_hand_q(s):
     s = float(np.clip(s, 0.0, 1.0))
     left = (1.0 - s) * DEX3_OPEN_Q_LEFT + s * DEX3_CLOSED_Q_LEFT
@@ -69,14 +79,7 @@ def dex3_oc_hand_q(s):
     return np.concatenate((left, right))
 
 
-START = False
-STOP = False
-READY = False
-RECORD_RUNNING = False
-RECORD_TOGGLE = False
-MAPPING_GUI_OPEN = False
-
-
+# Helper functions
 def on_press(key):
     global STOP, START, RECORD_TOGGLE
     if key == 'r':
@@ -104,6 +107,8 @@ def get_state() -> dict:
 
 
 if __name__ == '__main__':
+
+    # Parse arguments
     parser = argparse.ArgumentParser()
     parser.add_argument('--frequency', type=float, default=60.0)
     parser.add_argument('--input-mode', type=str, choices=['hand', 'controller'], default='hand')
@@ -136,6 +141,8 @@ if __name__ == '__main__':
     parser.add_argument('--cam-config', type=str, default=os.path.join(current_dir, 'utils', 'portal_cam_config.yaml'))
     args = parser.parse_args()
 
+
+
     if args.ee == "dex3" and args.input_mode == "controller" and args.dex3_oc_duration <= 0:
         parser.error("--dex3-oc-duration must be > 0.")
     if args.custom_mapping:
@@ -158,11 +165,13 @@ if __name__ == '__main__':
                 daemon=True)
             listen_keyboard_thread.start()
 
+        # Initialize arrays for hand position data
         left_hand_pos_array = None
         right_hand_pos_array = None
         dual_hand_data_lock = None
         dual_hand_state_array = None
         dual_hand_action_array = None
+        
         if args.ee == "dex3":
             dual_hand_data_lock = Lock()
             dual_hand_state_array = Array('d', 14, lock=False)
@@ -171,6 +180,7 @@ if __name__ == '__main__':
                 left_hand_pos_array = Array('d', 75, lock=True)
                 right_hand_pos_array = Array('d', 75, lock=True)
 
+        # Initialize teleop bridge (Connection to LiveKit Portal)
         teleop_bridge = PortalTeleopBridge(
             portal_yaml=args.portal_yaml,
             mapping_yaml=args.portal_mapping,
@@ -185,12 +195,12 @@ if __name__ == '__main__':
             dual_hand_state_array_out=dual_hand_state_array,
             dual_hand_action_array_out=dual_hand_action_array,
             cam_config_path=args.cam_config)
+
         camera_config = teleop_bridge.get_cam_config()
-        teleop_bridge.wait_until_connected()
+        xr_need_local_img = not (args.display_mode == 'pass-through' or camera_config['head_camera']['enable_webrtc'])
+        teleop_bridge.wait_until_connected() # Wait for connection to LiveKit Portal
 
-        xr_need_local_img = not (
-            args.display_mode == 'pass-through' or camera_config['head_camera']['enable_webrtc'])
-
+        # Initialize TeleVuerWrapper (XR display)
         tv_wrapper = TeleVuerWrapper(
             use_hand_tracking=args.input_mode == "hand",
             binocular=camera_config['head_camera']['binocular'],
@@ -204,6 +214,7 @@ if __name__ == '__main__':
         xr_motion_data_ready = Value('b', False, lock=True)
         teleop_bridge.set_xr_motion_data_ready(xr_motion_data_ready)
 
+        
         arm_ik = G1_29_ArmIK()
 
         if args.record:
@@ -292,20 +303,26 @@ if __name__ == '__main__':
             logger_mp.info("Press [q] to stop and exit the program.")
             READY = True
             teleop_bridge.set_fsm_id(FSM_IDLE)
+            teleop_bridge.send_go_home()
+            
+            # Wait for START Signal to start the main loop: Render the video feed to the XR device
             while not START and not STOP:
                 time.sleep(0.033)
                 if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
                     head_img = teleop_bridge.get_head_frame()
                     if head_img.bgr is not None:
-                        tv_wrapper.render_to_xr(head_img.bgr)
+                        tv_wrapper.render_to_xr(head_img.bgr) 
 
         if not STOP:
             logger_mp.info("start Tracking")
             teleop_bridge.set_fsm_id(FSM_TELEOP)
 
+        # Initialize LoopTiming for performance monitoring (maybe later only debug mode)
         timing = LoopTiming(logger_mp)
         teleop_bridge.on_rtt(lambda rtt_ms: timing.add("rtt_ms", rtt_ms))
         teleop_bridge.on_drops(lambda n: timing.count("obs_drops", n))
+
+        
         if args.record:
             teleop_bridge.configure_recording(
                 binocular=bool(camera_config['head_camera'].get('binocular')),
@@ -324,8 +341,11 @@ if __name__ == '__main__':
         elif args.ee == "dex3" and args.input_mode == "controller":
             dex3_oc_ramp = 1.0 / (args.dex3_oc_duration * args.frequency)
 
+        # Main loop
         while not STOP:
             start_time = time.time()
+
+            # Render frame to the XR device
             if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
                 head_img = teleop_bridge.get_head_frame()
                 if head_img is not None and head_img.bgr is not None:
