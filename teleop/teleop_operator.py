@@ -3,12 +3,14 @@
 No Unitree SDK. Pair with teleop_robot.py in the same LiveKit room.
 
     python teleop/teleop_operator.py --ee dex3 --arm G1_29 --input-mode hand
-    python teleop/teleop_operator.py --arm G1_29 --input-mode controller
+    python teleop/teleop_operator.py --ee dex3 --arm G1_29 --input-mode controller
+    python teleop/teleop_operator.py --ee dex3 --arm G1_29 --input-mode controller --motion
 """
 import time
 import argparse
 from multiprocessing import Value, Array, Lock
 import threading
+import numpy as np
 import logging_mp
 logging_mp.basicConfig(level=logging_mp.INFO)
 logger_mp = logging_mp.getLogger(__name__)
@@ -31,6 +33,31 @@ LOCO_SCALE = 0.3
 FSM_IDLE = 0
 FSM_TELEOP = 1
 FSM_HOME = 2
+
+# Dex3 hardware-order open/close poses (thumb only; index/middle stay open).
+# Left: thumb0, thumb1, thumb2, middle0, middle1, index0, index1
+# Right: thumb0, thumb1, thumb2, index0, index1, middle0, middle1
+DEX3_OPEN_Q_LEFT = np.zeros(7)
+DEX3_CLOSED_Q_LEFT = np.array([0.25, 0.78, 1.48, 0.0, 0.0, 0.0, 0.0])
+DEX3_OPEN_Q_RIGHT = np.zeros(7)
+DEX3_CLOSED_Q_RIGHT = np.array([-0.25, -0.78, -1.48, 0.0, 0.0, 0.0, 0.0])
+
+
+def ramp_dex3_oc(s, close_pressed, open_pressed, ramp):
+    """Update open/close scalar in [0, 1]. X (close) wins if both are held."""
+    if close_pressed:
+        return min(1.0, s + ramp)
+    if open_pressed:
+        return max(0.0, s - ramp)
+    return s
+
+
+def dex3_oc_hand_q(s):
+    s = float(np.clip(s, 0.0, 1.0))
+    left = (1.0 - s) * DEX3_OPEN_Q_LEFT + s * DEX3_CLOSED_Q_LEFT
+    right = (1.0 - s) * DEX3_OPEN_Q_RIGHT + s * DEX3_CLOSED_Q_RIGHT
+    return np.concatenate((left, right))
+
 
 START = False
 STOP = False
@@ -69,6 +96,10 @@ if __name__ == '__main__':
     parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive')
     parser.add_argument('--arm', type=str, choices=['G1_29'], default='G1_29')
     parser.add_argument('--ee', type=str, choices=['dex3'], default=None)
+    parser.add_argument('--motion', action='store_true',
+                        help='Read vx/vy/vyaw from controller thumbsticks (robot must also use --motion)')
+    parser.add_argument('--dex3-oc-duration', type=float, default=1.5,
+                        help='Seconds for a full Dex3 open↔close ramp via left X/Y (controller mode only)')
     parser.add_argument('--headless', action='store_true')
     parser.add_argument('--ipc', action='store_true')
     parser.add_argument('--record', action='store_true')
@@ -86,8 +117,8 @@ if __name__ == '__main__':
     parser.add_argument('--cam-config', type=str, default=os.path.join(current_dir, 'utils', 'portal_cam_config.yaml'))
     args = parser.parse_args()
 
-    if args.ee == "dex3" and args.input_mode == "controller":
-        parser.error("--ee dex3 does not support controller input mode.")
+    if args.ee == "dex3" and args.input_mode == "controller" and args.dex3_oc_duration <= 0:
+        parser.error("--dex3-oc-duration must be > 0.")
 
     try:
         if args.ipc:
@@ -106,11 +137,12 @@ if __name__ == '__main__':
         dual_hand_state_array = None
         dual_hand_action_array = None
         if args.ee == "dex3":
-            left_hand_pos_array = Array('d', 75, lock=True)
-            right_hand_pos_array = Array('d', 75, lock=True)
             dual_hand_data_lock = Lock()
             dual_hand_state_array = Array('d', 14, lock=False)
             dual_hand_action_array = Array('d', 14, lock=False)
+            if args.input_mode == "hand":
+                left_hand_pos_array = Array('d', 75, lock=True)
+                right_hand_pos_array = Array('d', 75, lock=True)
 
         teleop_bridge = PortalTeleopBridge(
             portal_yaml=args.portal_yaml,
@@ -158,6 +190,11 @@ if __name__ == '__main__':
 
         logger_mp.info("----------------------------------------------------------------")
         logger_mp.info("Press [r] to start syncing the robot with your movements.")
+        if args.ee == "dex3" and args.input_mode == "controller":
+            logger_mp.info("Dex3 X/Y: left X=close, left Y=open, right A=e-stop "
+                           f"(duration={args.dex3_oc_duration}s).")
+        if args.motion:
+            logger_mp.info("Motion: thumbsticks send vx/vy/vyaw (robot must also use --motion).")
         if args.record:
             logger_mp.info("Press [s] to START or SAVE recording (toggle cycle).")
         logger_mp.info("Press [q] to stop and exit the program.")
@@ -180,6 +217,10 @@ if __name__ == '__main__':
         head_img = None
         left_wrist_img = None
         right_wrist_img = None
+        dex3_oc_s = 0.0
+        dex3_oc_ramp = 0.0
+        if args.ee == "dex3" and args.input_mode == "controller":
+            dex3_oc_ramp = 1.0 / (args.dex3_oc_duration * args.frequency)
 
         while not STOP:
             start_time = time.time()
@@ -205,11 +246,19 @@ if __name__ == '__main__':
                     recorder.save_episode()
 
             tele_data = tv_wrapper.get_tele_data()
+            controller_hand_q = None
             if args.ee == "dex3" and args.input_mode == "hand":
                 with left_hand_pos_array.get_lock():
                     left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
                 with right_hand_pos_array.get_lock():
                     right_hand_pos_array[:] = tele_data.right_hand_pos.flatten()
+            elif args.ee == "dex3" and args.input_mode == "controller":
+                dex3_oc_s = ramp_dex3_oc(
+                    dex3_oc_s,
+                    tele_data.left_ctrl_aButton,
+                    tele_data.left_ctrl_bButton,
+                    dex3_oc_ramp)
+                controller_hand_q = dex3_oc_hand_q(dex3_oc_s)
             with xr_motion_data_ready.get_lock():
                 xr_motion_data_ready.value = tele_data.motion_data_ready
 
@@ -218,9 +267,10 @@ if __name__ == '__main__':
                 if tele_data.right_ctrl_aButton:
                     START = False
                     STOP = True
-                vx = -tele_data.left_ctrl_thumbstickValue[1] * LOCO_SCALE
-                vy = -tele_data.left_ctrl_thumbstickValue[0] * LOCO_SCALE
-                vyaw = -tele_data.right_ctrl_thumbstickValue[0] * LOCO_SCALE
+                if args.motion:
+                    vx = -tele_data.left_ctrl_thumbstickValue[1] * LOCO_SCALE
+                    vy = -tele_data.left_ctrl_thumbstickValue[0] * LOCO_SCALE
+                    vyaw = -tele_data.right_ctrl_thumbstickValue[0] * LOCO_SCALE
 
             current_lr_arm_q = teleop_bridge.get_current_dual_arm_q()
             current_lr_arm_dq = teleop_bridge.get_current_dual_arm_dq()
@@ -238,22 +288,28 @@ if __name__ == '__main__':
             age_ms = teleop_bridge.state_age_ms()
             if age_ms is not None:
                 timing.add("state_age_ms", age_ms)
-            teleop_bridge.send_targets(sol_q, vx=vx, vy=vy, vyaw=vyaw, fsm_id=fsm)
+            teleop_bridge.send_targets(sol_q, hand_q=controller_hand_q, vx=vx, vy=vy, vyaw=vyaw, fsm_id=fsm)
 
             if args.record:
                 READY = recorder.is_ready()
+                left_ee_state = []
+                right_ee_state = []
+                left_hand_action = []
+                right_hand_action = []
                 if args.ee == "dex3" and args.input_mode == "hand":
                     with dual_hand_data_lock:
                         left_ee_state = dual_hand_state_array[:7]
                         right_ee_state = dual_hand_state_array[-7:]
                         left_hand_action = dual_hand_action_array[:7]
                         right_hand_action = dual_hand_action_array[-7:]
-                else:
-                    left_ee_state = []
-                    right_ee_state = []
-                    left_hand_action = []
-                    right_hand_action = []
-                    current_body_action = [vx, vy, vyaw] if args.input_mode == "controller" else []
+                elif args.ee == "dex3" and args.input_mode == "controller":
+                    with dual_hand_data_lock:
+                        left_ee_state = dual_hand_state_array[:7]
+                        right_ee_state = dual_hand_state_array[-7:]
+                    if controller_hand_q is not None:
+                        left_hand_action = controller_hand_q[:7].tolist()
+                        right_hand_action = controller_hand_q[7:].tolist()
+                body_action = [vx, vy, vyaw] if args.input_mode == "controller" and args.motion else []
                 reported = teleop_bridge.get_reported_arm_q()
                 rec_q = reported if reported is not None else current_lr_arm_q
                 half = len(rec_q) // 2
@@ -285,7 +341,7 @@ if __name__ == '__main__':
                         "right_arm": {"qpos": right_arm_action.tolist(), "qvel": [], "torque": []},
                         "left_ee": {"qpos": left_hand_action, "qvel": [], "torque": []},
                         "right_ee": {"qpos": right_hand_action, "qvel": [], "torque": []},
-                        "body": {"qpos": [vx, vy, vyaw] if args.input_mode == "controller" else []},
+                        "body": {"qpos": body_action},
                     }
                     recorder.add_item(colors=colors, depths=depths, states=states, actions=actions)
 
