@@ -145,7 +145,7 @@ def _video_publish_loop(img_client, portal, track, stop_evt, fps: float, clock: 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--frequency', type=float, default=60.0, help='state publish rate')
+    parser.add_argument('--frequency', type=float, default=30.0, help='state publish rate')
     parser.add_argument('--arm', type=str, choices=['G1_29'], default='G1_29')
     parser.add_argument('--ee', type=str, choices=['dex3'], default=None)
     parser.add_argument('--motion', action='store_true')
@@ -161,7 +161,7 @@ if __name__ == '__main__':
     parser.add_argument('--livekit-url', type=str, default=None)
     parser.add_argument('--livekit-room', type=str, default=None)
     parser.add_argument('--portal-identity', type=str, default='xr-robot')
-    parser.add_argument('--cmd-tau', type=float, default=0.15,
+    parser.add_argument('--cmd-tau', type=float, default=0.8,
                         help='command smoothing time (s); 0 = off. Switch interp/filter in the TELEOP loop.')
     args = parser.parse_args()
 
@@ -173,7 +173,7 @@ if __name__ == '__main__':
 
     loco_wrapper = None
     if args.motion:
-        loco_wrapper = LocoClientWrapper()
+        loco_wrapper = LocoClientWrapper(robot_type="G1")
     else:
         motion_switcher = MotionSwitcher()
         status, result = motion_switcher.Enter_Debug_Mode()
@@ -262,8 +262,8 @@ if __name__ == '__main__':
                         hand_cmd['q'] = np.asarray(hand_ctrl.get_current_dual_hand_q(), dtype=float).copy()
                 if hand_ctrl is not None and action.hand_q.size:
                     half = action.hand_q.size // 2
-                    hand_q = action.hand_q
-                    #hand_q = interp_cmd(hand_cmd, action.hand_q, start, args.cmd_tau)
+                    #hand_q = action.hand_q
+                    hand_q = interp_cmd(hand_cmd, action.hand_q, start, args.cmd_tau)
                     hand_ctrl.ctrl_dual_hand(hand_q[:half], hand_q[half:])
                 applied_fsm = FSM_HAND_SETUP
             elif fsm == FSM_TELEOP and action:
@@ -277,8 +277,8 @@ if __name__ == '__main__':
                 tauff = np.zeros_like(action.arm_q)
                 
                 # pick one (arm + hand must match):
-                arm_q = action.arm_q
-                #arm_q = interp_cmd(arm_cmd, action.arm_q, start, args.cmd_tau)
+                #arm_q = action.arm_q
+                arm_q = interp_cmd(arm_cmd, action.arm_q, start, args.cmd_tau)
                 # arm_q = filter_cmd(arm_cmd, action.arm_q, dt, args.cmd_tau)
                 arm_ctrl.ctrl_dual_arm(arm_q, tauff)
                 if hand_ctrl is not None and action.hand_q.size:
@@ -305,7 +305,14 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         logger_mp.info("KeyboardInterrupt, exiting ...")
     finally:
-
+        try:
+            if motion_switcher is not None:
+                motion_switcher.Exit_Debug_Mode()
+                logger_mp.info(f"Exit debug / SelectMode('ai'): status={status} result={result}")
+                _, mode = motion_switcher.msc.CheckMode()
+                logger_mp.info(f"CheckMode after exit: {mode}")
+        except Exception as e:
+            logger_mp.error(f"Exit debug mode failed: {e}")
         try:
             portal.close()
         except Exception as e:
