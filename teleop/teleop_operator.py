@@ -38,36 +38,18 @@ from teleop.utils.dex3_pose_mapping import (
     target_q,
 )
 
+
+# Global variables
 LOCO_SCALE = 0.3
 FSM_IDLE = 0
 FSM_TELEOP = 1
 FSM_HOME = 2
 FSM_HAND_SETUP = 3
 
-# Dex3 hardware-order open/close poses (thumb only; index/middle stay open).
-# Left: thumb0, thumb1, thumb2, middle0, middle1, index0, index1
-# Right: thumb0, thumb1, thumb2, index0, index1, middle0, middle1
 DEX3_OPEN_Q_LEFT = np.zeros(7)
 DEX3_CLOSED_Q_LEFT = np.array([0.25, 0.78, 1.48, 0.0, 0.0, 0.0, 0.0])
 DEX3_OPEN_Q_RIGHT = np.zeros(7)
 DEX3_CLOSED_Q_RIGHT = np.array([-0.25, -0.78, -1.48, 0.0, 0.0, 0.0, 0.0])
-
-
-def ramp_dex3_oc(s, close_pressed, open_pressed, ramp):
-    """Update open/close scalar in [0, 1]. X (close) wins if both are held."""
-    if close_pressed:
-        return min(1.0, s + ramp)
-    if open_pressed:
-        return max(0.0, s - ramp)
-    return s
-
-
-def dex3_oc_hand_q(s):
-    s = float(np.clip(s, 0.0, 1.0))
-    left = (1.0 - s) * DEX3_OPEN_Q_LEFT + s * DEX3_CLOSED_Q_LEFT
-    right = (1.0 - s) * DEX3_OPEN_Q_RIGHT + s * DEX3_CLOSED_Q_RIGHT
-    return np.concatenate((left, right))
-
 
 START = False
 STOP = False
@@ -76,6 +58,22 @@ RECORD_RUNNING = False
 RECORD_TOGGLE = False
 MAPPING_GUI_OPEN = False
 
+
+# This should be moved to robot_hand_unitree.py
+def ramp_dex3_oc(s, close_pressed, open_pressed, ramp):
+    """Update open/close scalar in [0, 1]. X (close) wins if both are held."""
+    if close_pressed:
+        return min(1.0, s + ramp)
+    if open_pressed:
+        return max(0.0, s - ramp)
+    return s
+
+# Helper functions
+def dex3_oc_hand_q(s):
+    s = float(np.clip(s, 0.0, 1.0))
+    left = (1.0 - s) * DEX3_OPEN_Q_LEFT + s * DEX3_CLOSED_Q_LEFT
+    right = (1.0 - s) * DEX3_OPEN_Q_RIGHT + s * DEX3_CLOSED_Q_RIGHT
+    return np.concatenate((left, right))
 
 def on_press(key):
     global STOP, START, RECORD_TOGGLE
@@ -103,7 +101,9 @@ def get_state() -> dict:
     }
 
 
+
 if __name__ == '__main__':
+    # Parse arguments
     parser = argparse.ArgumentParser()
     parser.add_argument('--frequency', type=float, default=30.0)
     parser.add_argument('--input-mode', type=str, choices=['hand', 'controller'], default='hand')
@@ -158,6 +158,7 @@ if __name__ == '__main__':
                 daemon=True)
             listen_keyboard_thread.start()
 
+        # Initialize arrays for hand position data
         left_hand_pos_array = None
         right_hand_pos_array = None
         dual_hand_data_lock = None
@@ -171,6 +172,7 @@ if __name__ == '__main__':
                 left_hand_pos_array = Array('d', 75, lock=True)
                 right_hand_pos_array = Array('d', 75, lock=True)
 
+        # Initialize teleop bridge (Connection to LiveKit Portal)
         teleop_bridge = PortalTeleopBridge(
             portal_yaml=args.portal_yaml,
             mapping_yaml=args.portal_mapping,
@@ -191,6 +193,7 @@ if __name__ == '__main__':
         xr_need_local_img = not (
             args.display_mode == 'pass-through' or camera_config['head_camera']['enable_webrtc'])
 
+        # Initialize TeleVuerWrapper (XR display)
         tv_wrapper = TeleVuerWrapper(
             use_hand_tracking=args.input_mode == "hand",
             binocular=camera_config['head_camera']['binocular'],
@@ -204,6 +207,7 @@ if __name__ == '__main__':
         xr_motion_data_ready = Value('b', False, lock=True)
         teleop_bridge.set_xr_motion_data_ready(xr_motion_data_ready)
 
+
         arm_ik = G1_29_ArmIK()
 
         if args.record:
@@ -214,7 +218,8 @@ if __name__ == '__main__':
                 task_steps=args.task_steps,
                 frequency=args.frequency,
                 rerun_log=not args.headless)
-
+        
+        # Setting up controller mapping to hands: Custom mapping will open a GUI
         if mapping_mode == "load":
             custom_spec = load(args.hand_pose_yaml)
             logger_mp.info(
@@ -275,6 +280,7 @@ if __name__ == '__main__':
                         f"Wrote Dex3 pose mapping to {args.hand_pose_yaml} "
                         f"({len(custom_spec.bindings)} bindings).")
 
+
         if not STOP:
             logger_mp.info("----------------------------------------------------------------")
             logger_mp.info("Press [r] to start syncing the robot with your movements.")
@@ -293,6 +299,8 @@ if __name__ == '__main__':
             READY = True
             teleop_bridge.set_fsm_id(FSM_IDLE)
             teleop_bridge.send_go_home()
+        
+            # Wait for START signal: render frames to XR display
             while not START and not STOP:
                 time.sleep(0.033)
                 if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
@@ -314,14 +322,17 @@ if __name__ == '__main__':
         dex3_oc_s = 0.0
         dex3_oc_ramp = 0.0
         custom_current_q = None
-        custom_ramp = 0.0
+        custom_ramp = 0.0LOCO_SCALE
         if custom_spec is not None:
             custom_current_q = list(custom_spec.default_q)
             custom_ramp = ramp_step(args.dex3_oc_duration, args.frequency)
         elif args.ee == "dex3" and args.input_mode == "controller":
             dex3_oc_ramp = 1.0 / (args.dex3_oc_duration * args.frequency)
-
+        
+        # Main loop
         while not STOP:
+
+            # Get frame from Livekit Portal 
             start_time = time.time()
             if camera_config['head_camera']['enable_zmq']:
                 if args.record or xr_need_local_img:
@@ -332,6 +343,7 @@ if __name__ == '__main__':
                 left_wrist_img = teleop_bridge.get_left_wrist_frame()
             if camera_config['right_wrist_camera']['enable_zmq'] and args.record:
                 right_wrist_img = teleop_bridge.get_right_wrist_frame()
+
 
             if args.record and RECORD_TOGGLE:
                 RECORD_TOGGLE = False
@@ -344,6 +356,7 @@ if __name__ == '__main__':
                     RECORD_RUNNING = False
                     recorder.save_episode()
 
+            # Get teleop data from TeleVuerWrapper
             tele_data = tv_wrapper.get_tele_data()
             controller_hand_q = None
             if args.ee == "dex3" and args.input_mode == "hand":
@@ -377,9 +390,13 @@ if __name__ == '__main__':
                     vy = -tele_data.left_ctrl_thumbstickValue[0] * LOCO_SCALE
                     vyaw = -tele_data.right_ctrl_thumbstickValue[0] * LOCO_SCALE
 
+
+            # Get current arm position and velocity
             current_lr_arm_q = teleop_bridge.get_current_dual_arm_q()
             current_lr_arm_dq = teleop_bridge.get_current_dual_arm_dq()
             ik_t0 = time.perf_counter()
+
+            # Solve IK
             sol_q, sol_tauff = arm_ik.solve_ik(
                 tele_data.left_wrist_pose, tele_data.right_wrist_pose,
                 current_lr_arm_q, current_lr_arm_dq)
@@ -393,8 +410,11 @@ if __name__ == '__main__':
             age_ms = teleop_bridge.state_age_ms()
             if age_ms is not None:
                 timing.add("state_age_ms", age_ms)
+            
+            # Send targets to robot via Livekit Portal
             teleop_bridge.send_targets(sol_q, hand_q=controller_hand_q, vx=vx, vy=vy, vyaw=vyaw, fsm_id=fsm)
 
+            # Record data
             if args.record:
                 READY = recorder.is_ready()
                 left_ee_state = []
