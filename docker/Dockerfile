@@ -5,6 +5,7 @@
 
 ARG PORTAL_REF=4fb4385f3e4bfc8e5019abce64be9042d338166e
 ARG UNITREE_SDK2_REF=65691c8a8bc53b98d3976dba4dbf9d5d20b2e7f5
+ARG LAB_JETSON_IMAGE=neox/portal-robot:lab-jetson
 
 # ----- livekit-portal wheel (Python 3.10 + Rust FFI) -----
 FROM python:3.10-bookworm AS portal-build
@@ -76,20 +77,76 @@ RUN python -c "from livekit.portal import OperatorConfig, RobotConfig; \
 FROM base AS mock
 CMD ["python", "portal_robot_mock.py"]
 
-# ----- robot: README 1.2 unitree_sdk2_python at a pinned commit -----
-# setup.py has no package_data for utils/lib/*.so; pip install git+… drops crc_*.so.
-FROM base AS robot
+# ----- robot: Python 3.12 + MMAPI FFI from lab-jetson (not PyPI / not lab-jetson-v) -----
+# lab-jetson .so needs glibc >= 2.39. Official python has no *-noble tag;
+# slim-trixie is Debian 13 (glibc 2.41). Bookworm (2.36) cannot load the FFI.
+# Do not pip install livekit-portal — that overwrites the Jetson encoder.
+ARG LAB_JETSON_IMAGE=neox/portal-robot:lab-jetson
+FROM ${LAB_JETSON_IMAGE} AS lab-jetson
+
+FROM python:3.12-slim-trixie AS robot
 ARG UNITREE_SDK2_REF
-RUN apt-get update && apt-get install -y --no-install-recommends git \
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libglib2.0-0 \
+        libgomp1 \
+        libssl3t64 \
+        libx11-6 \
+        libxext6 \
+        libxfixes3 \
+        libgl1 \
+        libgbm1 \
+        libv4l-0t64 \
+        libegl1 \
+        libgles2 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=lab-jetson /opt/neox/venv/lib/python3.12/site-packages/livekit \
+    /usr/local/lib/python3.12/site-packages/livekit
+COPY --from=lab-jetson /opt/neox/venv/lib/python3.12/site-packages/livekit_portal-0.2.5.dist-info \
+    /usr/local/lib/python3.12/site-packages/livekit_portal-0.2.5.dist-info
+
+COPY teleop/ /app/teleop/
+WORKDIR /app/teleop
+
+# Do not import livekit.portal here: dlopen needs Tegra libs mounted at runtime.
+RUN pip install --no-cache-dir \
+        "numpy<2.0.0" \
+        pyyaml \
+        python-dotenv \
+        "livekit-api>=0.7" \
+        logging-mp \
+    && python -c "\
+from pathlib import Path; \
+p = Path('/usr/local/lib/python3.12/site-packages/livekit/portal/liblivekit_portal_ffi.so'); \
+data = p.read_bytes(); \
+assert b'nvhost-msenc' in data or b'Using Jetson' in data, \
+    'copied FFI has no Jetson MMAPI (do not use lab-jetson-v / PyPI)'"
+
+# setup.py has no package_data for utils/lib/*.so; pip install git+… drops crc_*.so.
+# aarch64: pip cyclonedds needs the C library; build eclipse-cyclonedds first.
+RUN apt-get update && apt-get install -y --no-install-recommends git cmake build-essential \
+    && git clone --branch releases/0.10.x https://github.com/eclipse-cyclonedds/cyclonedds.git /tmp/cyclonedds \
+    && mkdir /tmp/cyclonedds/build && cd /tmp/cyclonedds/build \
+    && cmake -DCMAKE_INSTALL_PREFIX=/usr/local .. \
+    && make -j$(nproc) install \
     && git clone https://github.com/unitreerobotics/unitree_sdk2_python.git /tmp/unitree_sdk2_python \
     && git -C /tmp/unitree_sdk2_python checkout "${UNITREE_SDK2_REF}" \
     && pip install --no-cache-dir --no-deps /tmp/unitree_sdk2_python \
-    && pip install --no-cache-dir \
+    && env CYCLONEDDS_HOME=/usr/local pip install --no-cache-dir \
         "cyclonedds==0.10.2" \
         "opencv-python-headless>=4.8,<4.11" \
         "numpy<2.0.0" \
         pyzmq \
-    && pip install --no-cache-dir --no-deps /app/teleop/teleimager \
+    && pip install --no-cache-dir --no-deps --ignore-requires-python /app/teleop/teleimager \
     && python -c "\
 import os, shutil, unitree_sdk2py.utils.crc as crc; \
 src = '/tmp/unitree_sdk2_python/unitree_sdk2py/utils/lib'; \
@@ -98,8 +155,8 @@ os.makedirs(dst, exist_ok=True); \
 shutil.copytree(src, dst, dirs_exist_ok=True)" \
     && python -c "from unitree_sdk2py.utils.crc import CRC; CRC()" \
     && python -c "from teleimager.image_client import ImageClient" \
-    && rm -rf /tmp/unitree_sdk2_python /root/.cache/pip \
-    && apt-get purge -y git \
+    && rm -rf /tmp/unitree_sdk2_python /tmp/cyclonedds /root/.cache/pip \
+    && apt-get purge -y git cmake build-essential \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 CMD ["python", "teleop_robot.py", "--ee", "dex3", "--arm", "G1_29"]

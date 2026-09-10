@@ -25,6 +25,51 @@ if parent2_dir not in sys.path:
 from teleop.robot_control.portal_mapping import PortalMapping
 from teleop.robot_control.portal_operator import mint_portal_token, _load_dotenv
 
+# Encode stays in livekit-portal FFI. This gate only checks the Jetson device.
+HW_ENCODE_DEVICE = "/dev/nvhost-msenc"
+_REQUIRE_TRUE = frozenset({"1", "true", "yes", "on"})
+
+
+def require_hw_encode_enabled() -> bool:
+    return os.environ.get("SAG_REQUIRE_HW_ENCODE", "0").strip().lower() in _REQUIRE_TRUE
+
+
+def hw_encode_device_path() -> str | None:
+    if os.path.exists(HW_ENCODE_DEVICE):
+        return HW_ENCODE_DEVICE
+    return None
+
+
+def hw_encode_open_fds(fd_dir: str = "/proc/self/fd") -> list[str]:
+    """Return symlink targets under fd_dir that point at the Jetson encoder device."""
+    found: list[str] = []
+    try:
+        names = os.listdir(fd_dir)
+    except OSError:
+        return found
+    for name in names:
+        link = os.path.join(fd_dir, name)
+        try:
+            target = os.readlink(link)
+        except OSError:
+            continue
+        if "nvhost-msenc" in target:
+            found.append(target)
+    return found
+
+
+def assert_hw_encode_ready(*, require_hw: bool) -> None:
+    """Fail-closed when require_hw and /dev/nvhost-msenc is missing."""
+    path = hw_encode_device_path()
+    if path:
+        logger_mp.info(f"[portal-robot] HW encode device {path}")
+        return
+    if require_hw:
+        raise RuntimeError("encode_unavailable: msenc missing; fail-closed")
+    logger_mp.warning(
+        "[portal-robot] no /dev/nvhost-msenc; software encode fallback allowed"
+    )
+
 
 class PortalRobotTransport:
     """connect / on_action / send_state around livekit.portal.Robot."""
@@ -48,6 +93,10 @@ class PortalRobotTransport:
                 "LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET missing "
                 f"(looked in env and {env_file})"
             )
+
+        assert_hw_encode_ready(
+            require_hw=os.environ.get("SAG_REQUIRE_HW_ENCODE", "0") == "1"
+        )
 
         mapping_yaml = mapping_yaml or os.path.join(parent_dir, "portal_mapping.yaml")
         self.mapping = PortalMapping(mapping_yaml, portal_yaml)
