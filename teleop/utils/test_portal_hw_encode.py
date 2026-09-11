@@ -22,12 +22,11 @@ if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
 
 from teleop.robot_control import portal_robot as portal_robot_mod
-from teleop.robot_control.portal_robot import (
-    assert_hw_encode_ready,
-    hw_encode_device_path,
-    hw_encode_open_fds,
-    require_hw_encode_enabled,
+from teleop.robot_control.encode import (
+    JetsonMsencEncodeCapability,
+    assert_encode_ready,
 )
+from teleop.robot_control.portal_robot import hw_encode_open_fds
 
 COMPOSE_YML = os.path.join(_repo_root, "docker", "compose.yml")
 PORTAL_YAML = os.path.join(_teleop_dir, "portal.yaml")
@@ -35,47 +34,49 @@ MAPPING_YAML = os.path.join(_teleop_dir, "portal_mapping.yaml")
 
 
 class ProbeTests(unittest.TestCase):
-    def test_require_flag(self):
-        cases = {
-            "": False,
-            "0": False,
-            "false": False,
-            "1": True,
-            "true": True,
-            "YES": True,
-            "on": True,
-        }
-        for raw, expected in cases.items():
-            with self.subTest(raw=raw), mock.patch.dict(os.environ, {"SAG_REQUIRE_HW_ENCODE": raw}, clear=False):
-                self.assertEqual(require_hw_encode_enabled(), expected)
-
-        with mock.patch.dict(os.environ, {}, clear=True):
-            os.environ.pop("SAG_REQUIRE_HW_ENCODE", None)
-            self.assertFalse(require_hw_encode_enabled())
-
-    def test_require_1_missing_device_raises(self):
-        with mock.patch.object(portal_robot_mod, "HW_ENCODE_DEVICE", "/no/such/msenc"):
-            with self.assertRaises(RuntimeError) as ctx:
-                assert_hw_encode_ready(require_hw=True)
+    def test_require_hw_missing_device_unavailable(self):
+        missing = os.path.join(tempfile.gettempdir(), "no-msenc")
+        cap = JetsonMsencEncodeCapability(device_path=missing, require_hw=True)
+        report = cap.probe()
+        self.assertEqual(report.backend, "unavailable")
+        with self.assertRaises(RuntimeError) as ctx:
+            assert_encode_ready(cap)
         self.assertIn("encode_unavailable", str(ctx.exception))
         self.assertIn("msenc missing", str(ctx.exception))
 
-    def test_unset_missing_device_warns(self):
-        env = {k: v for k, v in os.environ.items() if k != "SAG_REQUIRE_HW_ENCODE"}
-        with mock.patch.dict(os.environ, env, clear=True):
-            with mock.patch.object(portal_robot_mod, "HW_ENCODE_DEVICE", "/no/such/msenc"):
-                assert_hw_encode_ready(require_hw=False)
-                self.assertIsNone(hw_encode_device_path())
+    def test_missing_device_software_when_not_required(self):
+        missing = os.path.join(tempfile.gettempdir(), "no-msenc")
+        report = JetsonMsencEncodeCapability(
+            device_path=missing, require_hw=False
+        ).probe()
+        self.assertEqual(report.backend, "software")
+        self.assertIsNone(report.device_path)
+        assert_encode_ready(
+            JetsonMsencEncodeCapability(device_path=missing, require_hw=False)
+        )
 
-    def test_zero_missing_device_warns(self):
-        with mock.patch.object(portal_robot_mod, "HW_ENCODE_DEVICE", "/no/such/msenc"):
-            assert_hw_encode_ready(require_hw=False)
-
-    def test_require_1_with_fake_device_ok(self):
+    def test_present_device_hardware(self):
         with tempfile.NamedTemporaryFile() as fake:
-            with mock.patch.object(portal_robot_mod, "HW_ENCODE_DEVICE", fake.name):
-                assert_hw_encode_ready(require_hw=True)
-                self.assertEqual(hw_encode_device_path(), fake.name)
+            path = fake.name
+            report = assert_encode_ready(
+                JetsonMsencEncodeCapability(device_path=path, require_hw=True)
+            )
+        self.assertEqual(report.backend, "hardware")
+        self.assertEqual(report.device_path, path)
+
+    def test_software_backend_forbidden_when_require_hw(self):
+        with mock.patch.dict(os.environ, {"SAG_ENCODE_BACKEND": "software"}):
+            cap = JetsonMsencEncodeCapability(require_hw=True)
+            self.assertEqual(cap.probe().backend, "unavailable")
+            with self.assertRaises(RuntimeError) as ctx:
+                assert_encode_ready(cap)
+            self.assertIn("encode_unavailable", str(ctx.exception))
+
+    def test_software_backend_allowed_when_not_required(self):
+        with mock.patch.dict(os.environ, {"SAG_ENCODE_BACKEND": "software"}):
+            report = JetsonMsencEncodeCapability(require_hw=False).probe()
+        self.assertEqual(report.backend, "software")
+        self.assertIn("SAG_ENCODE_BACKEND=software", report.detail)
 
     def test_open_fds_scans_symlinks(self):
         with tempfile.TemporaryDirectory() as td:
@@ -112,13 +113,14 @@ def _fake_livekit_module(order: list[str]):
 
 
 class InitOrderTests(unittest.TestCase):
-    def test_init_probes_before_robot_and_connect(self):
+    def test_init_probes_after_robot_before_connect(self):
         order: list[str] = []
-        real_assert = portal_robot_mod.assert_hw_encode_ready
+        real_assert = portal_robot_mod.assert_encode_ready
+        real_cap = portal_robot_mod.JetsonMsencEncodeCapability
 
-        def wrapped_assert(*args, **kwargs):
+        def wrapped_assert(capability):
             order.append("probe")
-            return real_assert(*args, **kwargs)
+            return real_assert(capability)
 
         env = {
             "LIVEKIT_URL": "ws://127.0.0.1:7880",
@@ -129,9 +131,17 @@ class InitOrderTests(unittest.TestCase):
         }
         fake_portal = _fake_livekit_module(order)
         with tempfile.NamedTemporaryFile() as fake_dev:
+            def cap_factory(*, require_hw=True, device_path=None):
+                return real_cap(
+                    device_path=fake_dev.name if device_path is None else device_path,
+                    require_hw=require_hw,
+                )
+
             with mock.patch.dict(os.environ, env):
-                with mock.patch.object(portal_robot_mod, "HW_ENCODE_DEVICE", fake_dev.name):
-                    with mock.patch.object(portal_robot_mod, "assert_hw_encode_ready", wrapped_assert):
+                with mock.patch.object(portal_robot_mod, "assert_encode_ready", wrapped_assert):
+                    with mock.patch.object(
+                        portal_robot_mod, "JetsonMsencEncodeCapability", cap_factory
+                    ):
                         with mock.patch.dict(sys.modules, {"livekit.portal": fake_portal}):
                             with mock.patch.object(portal_robot_mod, "_load_dotenv", lambda _p: None):
                                 with mock.patch.object(threading.Thread, "start", lambda self: None):
@@ -144,8 +154,8 @@ class InitOrderTests(unittest.TestCase):
         self.assertIn("probe", order)
         self.assertIn("config", order)
         self.assertIn("robot", order)
-        self.assertLess(order.index("probe"), order.index("robot"))
-        self.assertLess(order.index("probe"), order.index("config"))
+        self.assertLess(order.index("config"), order.index("probe"))
+        self.assertLess(order.index("robot"), order.index("probe"))
 
 
 class ComposeContractTests(unittest.TestCase):

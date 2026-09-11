@@ -58,6 +58,8 @@ H.264 is encoded in the **livekit-portal FFI / Jetson MMAPI**, not in Python. Py
 
 Compose fields on `robot` only: `runtime: nvidia`, `group_add` GIDs `44/103/994` (host `video`/`render`/`debug`; names fail in Debian slim), devices `nvhost-msenc` / `nvmap` / `nvhost-ctrl` / `nvhost-vic`, curated Tegra libs under `/opt/tegra-libs`, `SAG_REQUIRE_HW_ENCODE=1`, `RUST_LOG=info`. No `privileged: true` by default. Do not add `/dev/v4l2-nvenc` in this file (missing on JetPack 5; compose would fail).
 
+Startup (`PortalRobotTransport`) probes encode **capability** only: `/dev/nvhost-msenc` present, or `SAG_ENCODE_BACKEND=software` when HW is not required. Log line: `encode_capability backend=…`. That is not proof the FFI opened the device.
+
 `teleop_robot.py` Enter Debug Mode talks DDS. Do not start the default robot CMD while another stack owns the G1.
 
 ```bash
@@ -75,7 +77,7 @@ echo $SAG_REQUIRE_HW_ENCODE        # 1
 docker compose -f docker/compose.yml run --rm --no-deps robot python portal_hw_encode_check.py
 ```
 
-PASS only when `/proc/self/fd` points at `nvhost-msenc` **and** the FFI logs `Using Jetson MMAPI encoder for H264`. Device existence alone is not enough (`[OpenH264]` is the software fallback).
+PASS only when `/proc/self/fd` points at `nvhost-msenc` **and** the FFI logs `Using Jetson MMAPI encoder for H264`. The startup capability probe (device exists) is not enough (`[OpenH264]` is the software fallback).
 
 If logs show `Could not get EGL display connection` / `bBlitMode is set to TRUE`, NVENC is still used but RGB→NVMM is a **CPU blit**. That plus 1280×720 at 30 fps (and the host `teleimager` / SAG `videoconvert` pipelines) explains high CPU even with HW encode.
 
