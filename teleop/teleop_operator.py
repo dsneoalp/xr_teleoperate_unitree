@@ -322,7 +322,7 @@ if __name__ == '__main__':
         dex3_oc_s = 0.0
         dex3_oc_ramp = 0.0
         custom_current_q = None
-        custom_ramp = 0.0LOCO_SCALE
+        custom_ramp = 0.0
         if custom_spec is not None:
             custom_current_q = list(custom_spec.default_q)
             custom_ramp = ramp_step(args.dex3_oc_duration, args.frequency)

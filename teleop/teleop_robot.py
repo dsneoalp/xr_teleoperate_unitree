@@ -30,7 +30,7 @@ FSM_IDLE = 0
 FSM_TELEOP = 1
 FSM_HOME = 2
 FSM_HAND_SETUP = 3
-ACTION_TIMEOUT = 0.1
+ACTION_TIMEOUT = 0.2
 IMAGE_CLIENT_RETRIES = 50
 IMAGE_CLIENT_RETRY_S = 0.1
 
@@ -186,6 +186,7 @@ if __name__ == '__main__':
     arm_cmd = {}
     hand_cmd = {}
     last_tick = 0.0
+    loco_stale = False
 
     def on_action(action: UnpackedAction):
         now = time.time()
@@ -239,22 +240,34 @@ if __name__ == '__main__':
                         hand_cmd['q'] = np.asarray(hand_ctrl.get_current_dual_hand_q(), dtype=float).copy()
                 tauff = np.zeros_like(action.arm_q)
                 # pick one (arm + hand must match):
-                arm_q = action.arm_q
+                # arm_q = action.arm_q
                 # arm_q = interp_cmd(arm_cmd, action.arm_q, start, args.cmd_tau)
-                # arm_q = filter_cmd(arm_cmd, action.arm_q, dt, args.cmd_tau)
+                arm_q = filter_cmd(arm_cmd, action.arm_q, dt, args.cmd_tau)
                 arm_ctrl.ctrl_dual_arm(arm_q, tauff)
                 if hand_ctrl is not None and action.hand_q.size:
                     half = action.hand_q.size // 2
                     hand_q = interp_cmd(hand_cmd, action.hand_q, start, args.cmd_tau)
                     # hand_q = filter_cmd(hand_cmd, action.hand_q, dt, args.cmd_tau)
                     hand_ctrl.ctrl_dual_hand(hand_q[:half], hand_q[half:])
-                if loco_wrapper is not None:
-                    loco_wrapper.Move(action.vx, action.vy, action.vyaw)
                 applied_fsm = FSM_TELEOP
             else:
                 applied_fsm = FSM_IDLE
                 arm_cmd.clear()
                 hand_cmd.clear()
+
+            if loco_wrapper is not None:
+                vx, vy, vyaw = 0.0, 0.0, 0.0
+                if fsm == FSM_TELEOP and action is not None and age <= ACTION_TIMEOUT:
+                    vx, vy, vyaw = action.vx, action.vy, action.vyaw
+                    if loco_stale:
+                        logger_mp.info(f"action fresh (age={age:.3f}s), loco linear resume")
+                        loco_stale = False
+                elif fsm == FSM_TELEOP and action is not None:
+                    vyaw = action.vyaw
+                    if not loco_stale:
+                        logger_mp.info(f"action stale (age={age:.3f}s), loco linear stop")
+                        loco_stale = True
+                loco_wrapper.Move(vx, vy, vyaw)
 
             motor_q = arm_ctrl.get_current_motor_q()
             hand_q = hand_ctrl.get_current_dual_hand_q() if hand_ctrl is not None else None
