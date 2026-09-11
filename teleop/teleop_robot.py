@@ -30,7 +30,7 @@ FSM_IDLE = 0
 FSM_TELEOP = 1
 FSM_HOME = 2
 FSM_HAND_SETUP = 3
-ACTION_TIMEOUT = 0.2
+ACTION_TIMEOUT = 0.1
 IMAGE_CLIENT_RETRIES = 50
 IMAGE_CLIENT_RETRY_S = 0.1
 
@@ -131,7 +131,7 @@ if __name__ == '__main__':
     parser.add_argument('--livekit-url', type=str, default=None)
     parser.add_argument('--livekit-room', type=str, default=None)
     parser.add_argument('--portal-identity', type=str, default='xr-robot')
-    parser.add_argument('--cmd-tau', type=float, default=0.15,
+    parser.add_argument('--cmd-tau', type=float, default=0.3,
                         help='command smoothing time (s); 0 = off. Switch interp/filter in the TELEOP loop.')
     args = parser.parse_args()
 
@@ -225,7 +225,8 @@ if __name__ == '__main__':
                         hand_cmd['q'] = np.asarray(hand_ctrl.get_current_dual_hand_q(), dtype=float).copy()
                 if hand_ctrl is not None and action.hand_q.size:
                     half = action.hand_q.size // 2
-                    hand_q = interp_cmd(hand_cmd, action.hand_q, start, args.cmd_tau)
+                    hand_q = action.hand_q
+                    # hand_q = interp_cmd(hand_cmd, action.hand_q, start, args.cmd_tau)
                     hand_ctrl.ctrl_dual_hand(hand_q[:half], hand_q[half:])
                 applied_fsm = FSM_HAND_SETUP
             elif fsm == FSM_TELEOP and action:
@@ -238,7 +239,8 @@ if __name__ == '__main__':
                         hand_cmd['q'] = np.asarray(hand_ctrl.get_current_dual_hand_q(), dtype=float).copy()
                 tauff = np.zeros_like(action.arm_q)
                 # pick one (arm + hand must match):
-                arm_q = interp_cmd(arm_cmd, action.arm_q, start, args.cmd_tau)
+                arm_q = action.arm_q
+                # arm_q = interp_cmd(arm_cmd, action.arm_q, start, args.cmd_tau)
                 # arm_q = filter_cmd(arm_cmd, action.arm_q, dt, args.cmd_tau)
                 arm_ctrl.ctrl_dual_arm(arm_q, tauff)
                 if hand_ctrl is not None and action.hand_q.size:

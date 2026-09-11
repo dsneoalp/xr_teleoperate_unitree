@@ -202,6 +202,7 @@ class PortalTeleopBridge:
         self._last_sent_q = np.zeros(arm_dof)
         self._last_sent_dq = np.zeros(arm_dof)
         self._last_send_wall = 0.0
+        self._send_pending = False
 
         self._hand_lock = threading.Lock()
         self._hand_q = np.zeros(hand_dof)
@@ -344,10 +345,12 @@ class PortalTeleopBridge:
             return {}
 
     def send_targets(self, arm_q, hand_q=None, vx=0.0, vy=0.0, vyaw=0.0, fsm_id=None) -> None:
-        """Publish one action: arm (+ optional hand) targets and loco."""
+        """Publish the latest action (drop-oldest). Do not enqueue every pose."""
         q = np.asarray(arm_q, dtype=np.float64).copy()
         with self._arm_lock:
             self._q_target[:] = q
+            already_pending = self._send_pending
+            self._send_pending = True
         with self._hand_lock:
             if hand_q is not None:
                 self._hand_q[:] = np.asarray(hand_q, dtype=np.float64).reshape(-1)
@@ -356,11 +359,23 @@ class PortalTeleopBridge:
             self._vyaw = float(vyaw)
             if fsm_id is not None:
                 self._fsm_id = int(fsm_id)
-        if self._loop is not None and self._connected_evt.is_set():
-            try:
-                self._loop.call_soon_threadsafe(self._send_action_now, q)
-            except RuntimeError:
-                pass
+        if self._loop is None or not self._connected_evt.is_set():
+            with self._arm_lock:
+                self._send_pending = False
+            return
+        if already_pending:
+            return
+        try:
+            self._loop.call_soon_threadsafe(self._flush_action)
+        except RuntimeError:
+            with self._arm_lock:
+                self._send_pending = False
+
+    def _flush_action(self) -> None:
+        with self._arm_lock:
+            self._send_pending = False
+            q = self._q_target.copy()
+        self._send_action_now(q)
 
     def _send_action_now(self, q_arm: np.ndarray) -> None:
         with self._hand_lock:

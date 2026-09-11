@@ -2,8 +2,8 @@
 # Secrets stay in .env; room name comes from LIVEKIT_ROOM.
 version: 1
 fps: 30
-slack: 10
-tolerance: 4.0
+slack: 2          # video/state match depth (ticks); min 2 ≈ 67 ms @ 30 fps
+tolerance: 1.5    # match window in ticks; 4.0 was a wide teleop-viewer window
 state_reliable: false
 action_reliable: false
 reuse_stale_frames: false

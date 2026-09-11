@@ -36,6 +36,9 @@ class LocoClientWrapper:
             from unitree_sdk2py.h1.loco.h1_loco_client import LocoClient
         else:
             from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
+        self.client = LocoClient()
+        self.client.SetTimeout(0.0001)
+        self.client.Init()
 
     def Enter_Damp_Mode(self):
         self.client.Damp()
