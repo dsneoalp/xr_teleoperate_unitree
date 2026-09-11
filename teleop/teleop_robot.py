@@ -25,6 +25,7 @@ sys.path.append(parent_dir)
 from teleop.robot_control.portal_robot import PortalRobotTransport
 from teleop.robot_control.portal_mapping import UnpackedAction
 from teleop.utils.loop_timing import LoopTiming
+from teleop.utils.arm_stiffness import ARM_STIFFNESS_FADE_S
 
 FSM_IDLE = 0
 FSM_TELEOP = 1
@@ -142,6 +143,7 @@ if __name__ == '__main__':
     from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper
 
     loco_wrapper = None
+    motion_switcher = None
     if args.motion:
         loco_wrapper = LocoClientWrapper(robot_type="G1")
     else:
@@ -187,6 +189,8 @@ if __name__ == '__main__':
     hand_cmd = {}
     last_tick = 0.0
     loco_stale = False
+    operator_present = False
+    had_operator = False
 
     def on_action(action: UnpackedAction):
         now = time.time()
@@ -211,14 +215,26 @@ if __name__ == '__main__':
                 age = start - latest['wall'] if latest['wall'] else 1e9
 
             fsm = action.fsm_id if action is not None else FSM_IDLE
+            present = portal.has_operator()
+            if present and not operator_present:
+                logger_mp.info("operator in session; restore arm stiffness")
+                arm_ctrl.restore_arm_stiffness()
+                had_operator = True
+            elif (not present) and operator_present and had_operator:
+                logger_mp.info("no operator in session; fading arm stiffness")
+                arm_ctrl.fade_arm_stiffness()
+                applied_fsm = FSM_IDLE
+                arm_cmd.clear()
+                hand_cmd.clear()
+            operator_present = present
 
-            if fsm == FSM_HOME:
+            if present and fsm == FSM_HOME:
                 if applied_fsm != FSM_HOME:
                     arm_ctrl.ctrl_dual_arm_go_home()
                     applied_fsm = FSM_HOME
                 arm_cmd.clear()
                 hand_cmd.clear()
-            elif fsm == FSM_HAND_SETUP and action:
+            elif present and fsm == FSM_HAND_SETUP and action:
                 if applied_fsm != FSM_HAND_SETUP:
                     arm_cmd.clear()
                     hand_cmd.clear()
@@ -230,7 +246,7 @@ if __name__ == '__main__':
                     # hand_q = interp_cmd(hand_cmd, action.hand_q, start, args.cmd_tau)
                     hand_ctrl.ctrl_dual_hand(hand_q[:half], hand_q[half:])
                 applied_fsm = FSM_HAND_SETUP
-            elif fsm == FSM_TELEOP and action:
+            elif present and fsm == FSM_TELEOP and action:
                 if applied_fsm != FSM_TELEOP:
                     arm_ctrl.speed_gradual_max()
                     arm_cmd.clear()
@@ -250,19 +266,19 @@ if __name__ == '__main__':
                     # hand_q = filter_cmd(hand_cmd, action.hand_q, dt, args.cmd_tau)
                     hand_ctrl.ctrl_dual_hand(hand_q[:half], hand_q[half:])
                 applied_fsm = FSM_TELEOP
-            else:
+            elif present:
                 applied_fsm = FSM_IDLE
                 arm_cmd.clear()
                 hand_cmd.clear()
 
             if loco_wrapper is not None:
                 vx, vy, vyaw = 0.0, 0.0, 0.0
-                if fsm == FSM_TELEOP and action is not None and age <= ACTION_TIMEOUT:
+                if present and fsm == FSM_TELEOP and action is not None and age <= ACTION_TIMEOUT:
                     vx, vy, vyaw = action.vx, action.vy, action.vyaw
                     if loco_stale:
                         logger_mp.info(f"action fresh (age={age:.3f}s), loco linear resume")
                         loco_stale = False
-                elif fsm == FSM_TELEOP and action is not None:
+                elif present and fsm == FSM_TELEOP and action is not None:
                     vyaw = action.vyaw
                     if not loco_stale:
                         logger_mp.info(f"action stale (age={age:.3f}s), loco linear stop")
@@ -278,6 +294,12 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         logger_mp.info("KeyboardInterrupt, exiting ...")
     finally:
+        try:
+            logger_mp.info("robot shutdown; fading arm stiffness")
+            arm_ctrl.fade_arm_stiffness()
+            arm_ctrl.wait_arm_stiffness_fade(timeout=ARM_STIFFNESS_FADE_S + 0.5)
+        except Exception as e:
+            logger_mp.error(f"arm stiffness fade on shutdown failed: {e}")
         try:
             if motion_switcher is not None:
                 motion_switcher.Exit_Debug_Mode()

@@ -61,6 +61,10 @@ class PortalRobotTransport:
         self._robot = Robot(cfg)
         self._action_cb = None
         self._robot.on_action(self._on_action)
+        self._operators = set()
+        self._operators_lock = threading.Lock()
+        self._robot.on_operator_joined(self._on_operator_joined)
+        self._robot.on_operator_left(self._on_operator_left)
 
         self._stop_evt = threading.Event()
         self._connected_evt = threading.Event()
@@ -73,6 +77,35 @@ class PortalRobotTransport:
     def on_unpacked_action(self, callback) -> None:
         """callback(UnpackedAction) on the portal thread."""
         self._action_cb = callback
+
+    def has_operator(self) -> bool:
+        """True if at least one Portal operator is currently in the room."""
+        with self._operators_lock:
+            return bool(self._operators)
+
+    def _on_operator_joined(self, identity: str) -> None:
+        with self._operators_lock:
+            self._operators.add(identity)
+            n = len(self._operators)
+        logger_mp.info(f"[portal-robot] operator joined: {identity} (n={n})")
+
+    def _on_operator_left(self, identity: str) -> None:
+        with self._operators_lock:
+            self._operators.discard(identity)
+            n = len(self._operators)
+        logger_mp.info(f"[portal-robot] operator left: {identity} (n={n})")
+
+    def _seed_operators(self) -> None:
+        try:
+            current = list(self._robot.operators() or [])
+        except Exception as exc:
+            logger_mp.warning(f"[portal-robot] operators() seed failed: {exc}")
+            return
+        with self._operators_lock:
+            self._operators.update(current)
+            n = len(self._operators)
+        if current:
+            logger_mp.info(f"[portal-robot] seeded operators: {current} (n={n})")
 
     def _on_action(self, action) -> None:
         raw = getattr(action, "raw_values", None) or getattr(action, "values", None) or {}
@@ -118,6 +151,7 @@ class PortalRobotTransport:
             os.environ["LIVEKIT_API_KEY"], os.environ["LIVEKIT_API_SECRET"],
             self._identity, self._room)
         await self._robot.connect(self._url, token)
+        self._seed_operators()
         self._connected_evt.set()
         logger_mp.info(f"[portal-robot] connected as '{self._robot.local_identity()}'")
         while not self._stop_evt.is_set():

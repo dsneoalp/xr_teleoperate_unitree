@@ -481,10 +481,6 @@ if __name__ == '__main__':
         logger_mp.error(traceback.format_exc())
     finally:
         try:
-            teleop_bridge.send_go_home()
-        except Exception as e:
-            logger_mp.error(f"Failed to send_go_home: {e}")
-        try:
             if args.ipc:
                 ipc_server.stop()
             else:

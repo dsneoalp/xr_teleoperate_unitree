@@ -3,6 +3,8 @@ import threading
 import time
 from enum import IntEnum
 
+from teleop.utils.arm_stiffness import ARM_STIFFNESS_FADE_S, arm_stiffness_scale
+
 from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber, ChannelFactoryInitialize # dds
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import ( LowCmd_  as hg_LowCmd, LowState_ as hg_LowState) # idl for g1, h1_2
 from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
@@ -98,6 +100,11 @@ class G1_29_ArmController:
         self._speed_gradual_max = False
         self._gradual_start_time = None
         self._gradual_time = None
+        self._arm_nominal_kp = {}
+        self._arm_nominal_kd = {}
+        self._arm_stiffness_scale = 1.0
+        self._arm_fade_t0 = None
+        self._arm_fade_duration = ARM_STIFFNESS_FADE_S
 
         if self.motion_mode:
             self.lowcmd_publisher = ChannelPublisher(kTopicLowCommand_Motion, hg_LowCmd)
@@ -134,11 +141,13 @@ class G1_29_ArmController:
             self.msg.motor_cmd[id].mode = 1
             if id.value in arm_indices:
                 if self._Is_wrist_motor(id):
-                    self.msg.motor_cmd[id].kp = self.kp_wrist
-                    self.msg.motor_cmd[id].kd = self.kd_wrist
+                    kp, kd = self.kp_wrist, self.kd_wrist
                 else:
-                    self.msg.motor_cmd[id].kp = self.kp_low
-                    self.msg.motor_cmd[id].kd = self.kd_low
+                    kp, kd = self.kp_low, self.kd_low
+                self.msg.motor_cmd[id].kp = kp
+                self.msg.motor_cmd[id].kd = kd
+                self._arm_nominal_kp[id.value] = kp
+                self._arm_nominal_kd[id.value] = kd
             elif self._Is_foot_motor(id):
                 self.msg.motor_cmd[id].kp = self.kp_foot
                 self.msg.motor_cmd[id].kd = self.kd_foot
@@ -186,20 +195,35 @@ class G1_29_ArmController:
 
         while True:
             start_time = time.time()
+            fade_complete = False
 
             with self.ctrl_lock:
                 arm_q_target     = self.q_target
                 arm_tauff_target = self.tauff_target
+                if self._arm_fade_t0 is not None:
+                    t_elapsed = start_time - self._arm_fade_t0
+                    self._arm_stiffness_scale = arm_stiffness_scale(
+                        t_elapsed, self._arm_fade_duration)
+                    if t_elapsed >= self._arm_fade_duration:
+                        self._arm_fade_t0 = None
+                        self._arm_stiffness_scale = 0.0
+                        fade_complete = True
+                scale = self._arm_stiffness_scale
 
             cliped_arm_q_target = self.clip_arm_q_target(arm_q_target, velocity_limit = self.arm_velocity_limit)
 
             for idx, id in enumerate(G1_29_JointArmIndex):
                 self.msg.motor_cmd[id].q = cliped_arm_q_target[idx]
                 self.msg.motor_cmd[id].dq = 0
-                self.msg.motor_cmd[id].tau = arm_tauff_target[idx]   
+                self.msg.motor_cmd[id].tau = arm_tauff_target[idx]
+                self.msg.motor_cmd[id].kp = self._arm_nominal_kp[id.value] * scale
+                self.msg.motor_cmd[id].kd = self._arm_nominal_kd[id.value] * scale
 
             self.msg.crc = self.crc.Crc(self.msg)
             self.lowcmd_publisher.Write(self.msg)
+
+            if fade_complete:
+                logger_mp.info("[G1_29_ArmController] arm stiffness fade complete")
 
             if self._speed_gradual_max:
                 t_elapsed = start_time - self._gradual_start_time
@@ -218,6 +242,47 @@ class G1_29_ArmController:
         with self.ctrl_lock:
             self.q_target = q_target
             self.tauff_target = tauff_target
+
+    def restore_arm_stiffness(self):
+        '''Snap arm kp/kd back to the nominal teleop gains.'''
+        with self.ctrl_lock:
+            was_reduced = self._arm_fade_t0 is not None or self._arm_stiffness_scale < 1.0
+            self._arm_fade_t0 = None
+            self._arm_stiffness_scale = 1.0
+        if was_reduced:
+            logger_mp.info("[G1_29_ArmController] arm stiffness restored")
+
+    def fade_arm_stiffness(self, duration=ARM_STIFFNESS_FADE_S):
+        '''Start a tanh(x)/x fade of arm kp/kd to 0. Idempotent while fading.'''
+        duration = float(duration)
+        with self.ctrl_lock:
+            if self._arm_fade_t0 is not None:
+                return
+            if self._arm_stiffness_scale <= 0.0:
+                return
+            self._arm_fade_duration = duration
+            self._arm_fade_t0 = time.time()
+            scale = self._arm_stiffness_scale
+        logger_mp.info(
+            f"[G1_29_ArmController] fading arm stiffness from {scale:.3f} to 0 over {duration:.1f}s")
+
+    def wait_arm_stiffness_fade(self, timeout=None):
+        '''Block until the in-progress fade reaches 0, or timeout.'''
+        with self.ctrl_lock:
+            t0 = self._arm_fade_t0
+            duration = self._arm_fade_duration
+        if t0 is None:
+            return
+        if timeout is None:
+            timeout = duration + 0.5
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self.ctrl_lock:
+                done = self._arm_fade_t0 is None and self._arm_stiffness_scale <= 0.0
+            if done:
+                return
+            time.sleep(self.control_dt)
+        logger_mp.warning("[G1_29_ArmController] arm stiffness fade wait timed out")
 
     def get_mode_machine(self):
         '''Return current dds mode machine.'''
