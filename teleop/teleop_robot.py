@@ -22,6 +22,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 
+from teleop.robot_control.encode import EncodeUnavailableError
 from teleop.robot_control.portal_robot import PortalRobotTransport
 from teleop.robot_control.portal_mapping import UnpackedAction
 from teleop.utils.loop_timing import LoopTiming
@@ -106,6 +107,10 @@ def _video_publish_loop(img_client, portal, track, stop_evt, fps: float):
                     h, w = rgb.shape[:2]
                     logger_mp.info(f"publishing '{track}' {w}x{h} (video thread)")
                     logged = True
+        except EncodeUnavailableError as exc:
+            logger_mp.error(f"video thread HW encode DoD failed: {exc}")
+            stop_evt.set()
+            return
         except Exception as exc:
             logger_mp.warning(f"video thread: {exc}")
         sleep = interval - (time.time() - t0)
@@ -142,6 +147,7 @@ if __name__ == '__main__':
     from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper
 
     loco_wrapper = None
+    motion_switcher = None
     if args.motion:
         loco_wrapper = LocoClientWrapper(robot_type="G1")
     else:
@@ -258,8 +264,15 @@ if __name__ == '__main__':
             hand_q = hand_ctrl.get_current_dual_hand_q() if hand_ctrl is not None else None
             portal.send_state(motor_q=motor_q, hand_q=hand_q, fsm_id=fsm)
 
+            hw_err = portal.hw_encode_error
+            if hw_err is not None:
+                raise hw_err
+
             sleep = max(0.0, (1.0 / args.frequency) - (time.time() - start))
             time.sleep(sleep)
+    except EncodeUnavailableError as exc:
+        logger_mp.error(f"HW encode DoD failed: {exc}")
+        raise SystemExit(1) from exc
     except KeyboardInterrupt:
         logger_mp.info("KeyboardInterrupt, exiting ...")
     finally:

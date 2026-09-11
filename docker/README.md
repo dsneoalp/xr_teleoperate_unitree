@@ -50,6 +50,8 @@ If `my_poses.yaml` already exists, the operator loads it and skips the GUI. `--c
 
 ## G1 hardware encode
 
+Hardware accept (G1 agent): follow [`HW_ENCODE_G1_PROTOCOL.md`](HW_ENCODE_G1_PROTOCOL.md). Primary check is `portal_hw_encode_check.py` (no DDS). Device presence is not encode.
+
 H.264 is encoded in the **livekit-portal FFI / Jetson MMAPI**, not in Python. Python still sends RGB via `send_video_frame`. Only the **robot** service gets the encoder; mock and operator stay software.
 
 **Image:** `python:3.12-slim-trixie` (glibc 2.41; there is no official `*-noble` Python tag). The MMAPI `.so` is copied from local `neox/portal-robot:lab-jetson`. Do not copy it onto bookworm (glibc 2.36) and do not use `:lab-jetson-v` / PyPI. The Dockerfile asserts the FFI contains `nvhost-msenc` or `Using Jetson`.
@@ -58,7 +60,7 @@ H.264 is encoded in the **livekit-portal FFI / Jetson MMAPI**, not in Python. Py
 
 Compose fields on `robot` only: `runtime: nvidia`, `group_add` GIDs `44/103/994` (host `video`/`render`/`debug`; names fail in Debian slim), devices `nvhost-msenc` / `nvmap` / `nvhost-ctrl` / `nvhost-vic`, curated Tegra libs under `/opt/tegra-libs`, `SAG_REQUIRE_HW_ENCODE=1`, `RUST_LOG=info`. No `privileged: true` by default. Do not add `/dev/v4l2-nvenc` in this file (missing on JetPack 5; compose would fail).
 
-Startup (`PortalRobotTransport`) probes encode **capability** only: `/dev/nvhost-msenc` present, or `SAG_ENCODE_BACKEND=software` when HW is not required. Log line: `encode_capability backend=…`. That is not proof the FFI opened the device.
+Startup (`PortalRobotTransport`) still probes **device presence** before connect (`encode_capability backend=…`). With `SAG_REQUIRE_HW_ENCODE=1` (robot Compose), the **first RGB `send_video_frame`s** must also prove Jetson MMAPI within `SAG_HW_ENCODE_CONFIRM_S` (default 15s): `/proc/self/fd` on `nvhost-msenc` **and** FFI log `Using Jetson MMAPI encoder for H264`. `[OpenH264]` without that log exits the process (`encode_unavailable`). `--no-img` never sends frames, so this gate does not run. Mock/operator do not set the env.
 
 `teleop_robot.py` Enter Debug Mode talks DDS. Do not start the default robot CMD while another stack owns the G1.
 
@@ -77,7 +79,7 @@ echo $SAG_REQUIRE_HW_ENCODE        # 1
 docker compose -f docker/compose.yml run --rm --no-deps robot python portal_hw_encode_check.py
 ```
 
-PASS only when `/proc/self/fd` points at `nvhost-msenc` **and** the FFI logs `Using Jetson MMAPI encoder for H264`. The startup capability probe (device exists) is not enough (`[OpenH264]` is the software fallback).
+Default `teleop_robot.py` in this image uses the same fail-closed DoD once video frames start. PASS only when `/proc/self/fd` points at `nvhost-msenc` **and** the FFI logs `Using Jetson MMAPI encoder for H264`. The startup capability probe (device exists) is not enough (`[OpenH264]` is the software fallback).
 
 If logs show `Could not get EGL display connection` / `bBlitMode is set to TRUE`, NVENC is still used but RGB→NVMM is a **CPU blit**. That plus 1280×720 at 30 fps (and the host `teleimager` / SAG `videoconvert` pipelines) explains high CPU even with HW encode.
 

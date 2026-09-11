@@ -23,10 +23,15 @@ if _repo_root not in sys.path:
 
 from teleop.robot_control import portal_robot as portal_robot_mod
 from teleop.robot_control.encode import (
+    EncodeUnavailableError,
     JetsonMsencEncodeCapability,
+    MMAPI_LOG,
+    OPENH264_LOG,
     assert_encode_ready,
+    evaluate_hw_encode_evidence,
+    hw_encode_open_fds,
+    hw_encode_unavailable_message,
 )
-from teleop.robot_control.portal_robot import hw_encode_open_fds
 
 COMPOSE_YML = os.path.join(_repo_root, "docker", "compose.yml")
 PORTAL_YAML = os.path.join(_teleop_dir, "portal.yaml")
@@ -39,7 +44,7 @@ class ProbeTests(unittest.TestCase):
         cap = JetsonMsencEncodeCapability(device_path=missing, require_hw=True)
         report = cap.probe()
         self.assertEqual(report.backend, "unavailable")
-        with self.assertRaises(RuntimeError) as ctx:
+        with self.assertRaises(EncodeUnavailableError) as ctx:
             assert_encode_ready(cap)
         self.assertIn("encode_unavailable", str(ctx.exception))
         self.assertIn("msenc missing", str(ctx.exception))
@@ -68,7 +73,7 @@ class ProbeTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"SAG_ENCODE_BACKEND": "software"}):
             cap = JetsonMsencEncodeCapability(require_hw=True)
             self.assertEqual(cap.probe().backend, "unavailable")
-            with self.assertRaises(RuntimeError) as ctx:
+            with self.assertRaises(EncodeUnavailableError) as ctx:
                 assert_encode_ready(cap)
             self.assertIn("encode_unavailable", str(ctx.exception))
 
@@ -85,6 +90,34 @@ class ProbeTests(unittest.TestCase):
             os.symlink("/dev/v4l2-nvenc", os.path.join(td, "13"))
             found = hw_encode_open_fds(td)
         self.assertEqual(found, ["/dev/nvhost-msenc"])
+
+    def test_evidence_ok_needs_fd_and_mmapi_log(self):
+        self.assertEqual(
+            evaluate_hw_encode_evidence(["/dev/nvhost-msenc"], f"x {MMAPI_LOG} y"),
+            "ok",
+        )
+
+    def test_evidence_pending_without_log_or_fd(self):
+        self.assertEqual(evaluate_hw_encode_evidence([], MMAPI_LOG), "pending")
+        self.assertEqual(
+            evaluate_hw_encode_evidence(["/dev/nvhost-msenc"], "idle"),
+            "pending",
+        )
+
+    def test_evidence_openh264_without_mmapi_is_fail(self):
+        self.assertEqual(
+            evaluate_hw_encode_evidence([], f"{OPENH264_LOG} software"),
+            "openh264",
+        )
+        self.assertEqual(
+            evaluate_hw_encode_evidence(
+                ["/dev/nvhost-msenc"], f"{OPENH264_LOG} and {MMAPI_LOG}"
+            ),
+            "ok",
+        )
+        msg = hw_encode_unavailable_message("openh264", fds=[], n_frames=3)
+        self.assertIn("encode_unavailable", msg)
+        self.assertIn("OpenH264", msg)
 
 
 def _fake_livekit_module(order: list[str]):
@@ -104,8 +137,17 @@ def _fake_livekit_module(order: list[str]):
         def on_action(self, cb):
             pass
 
-        def connect(self, *a, **k):
-            raise AssertionError("connect must not run in this test")
+        def send_video_frame(self, *a, **k):
+            order.append("send_video")
+
+        def send_state(self, *a, **k):
+            pass
+
+        def disconnect(self):
+            pass
+
+        def close(self):
+            pass
 
     mod.RobotConfig = RobotConfig
     mod.Robot = Robot
@@ -156,6 +198,87 @@ class InitOrderTests(unittest.TestCase):
         self.assertIn("robot", order)
         self.assertLess(order.index("config"), order.index("probe"))
         self.assertLess(order.index("robot"), order.index("probe"))
+
+
+def _make_transport(order=None):
+    order = order if order is not None else []
+    env = {
+        "LIVEKIT_URL": "ws://127.0.0.1:7880",
+        "LIVEKIT_API_KEY": "devkey",
+        "LIVEKIT_API_SECRET": "secret",
+        "LIVEKIT_ROOM": "g1-portal",
+        "SAG_REQUIRE_HW_ENCODE": "1",
+        "SAG_HW_ENCODE_CONFIRM_S": "1",
+    }
+    fake_portal = _fake_livekit_module(order)
+    fake_dev = tempfile.NamedTemporaryFile()
+    real_cap = portal_robot_mod.JetsonMsencEncodeCapability
+
+    def cap_factory(*, require_hw=True, device_path=None):
+        return real_cap(
+            device_path=fake_dev.name if device_path is None else device_path,
+            require_hw=require_hw,
+        )
+
+    with mock.patch.dict(os.environ, env):
+        with mock.patch.object(portal_robot_mod, "JetsonMsencEncodeCapability", cap_factory):
+            with mock.patch.dict(sys.modules, {"livekit.portal": fake_portal}):
+                with mock.patch.object(portal_robot_mod, "_load_dotenv", lambda _p: None):
+                    with mock.patch.object(threading.Thread, "start", lambda self: None):
+                        portal = portal_robot_mod.PortalRobotTransport(
+                            portal_yaml=PORTAL_YAML,
+                            mapping_yaml=MAPPING_YAML,
+                            env_file=os.path.join(_teleop_dir, ".env"),
+                            identity="test-robot",
+                        )
+    portal._fake_dev = fake_dev  # keep file until test ends
+    return portal
+
+
+class ConfirmOnSendTests(unittest.TestCase):
+    def tearDown(self):
+        fake = getattr(self, "_fake_dev", None)
+        if fake is not None:
+            fake.close()
+
+    def test_send_video_raises_on_openh264(self):
+        portal = _make_transport()
+        self._fake_dev = portal._fake_dev
+        tee = mock.Mock()
+        tee.text.return_value = f"{OPENH264_LOG} fallback"
+        portal._tee = tee
+        with mock.patch.object(portal_robot_mod, "hw_encode_open_fds", return_value=[]):
+            with self.assertRaises(EncodeUnavailableError) as ctx:
+                portal.send_video_frame("head_camera", b"\x00" * 12, width=2, height=2)
+        self.assertIn("OpenH264", str(ctx.exception))
+        self.assertIsNotNone(portal.hw_encode_error)
+        self.assertFalse(portal.hw_encode_confirmed)
+
+    def test_send_video_confirms_on_fd_and_mmapi(self):
+        portal = _make_transport()
+        self._fake_dev = portal._fake_dev
+        tee = mock.Mock()
+        tee.text.return_value = f"ok {MMAPI_LOG}"
+        portal._tee = tee
+        with mock.patch.object(
+            portal_robot_mod, "hw_encode_open_fds", return_value=["/dev/nvhost-msenc"]
+        ):
+            portal.send_video_frame("head_camera", b"\x00" * 12, width=2, height=2)
+        self.assertTrue(portal.hw_encode_confirmed)
+        self.assertIsNone(portal.hw_encode_error)
+        tee.close.assert_called()
+
+    def test_send_video_timeout_without_evidence(self):
+        portal = _make_transport()
+        self._fake_dev = portal._fake_dev
+        portal._confirm_s = 0.0
+        tee = mock.Mock()
+        tee.text.return_value = "silence"
+        portal._tee = tee
+        with mock.patch.object(portal_robot_mod, "hw_encode_open_fds", return_value=[]):
+            with self.assertRaises(EncodeUnavailableError) as ctx:
+                portal.send_video_frame("head_camera", b"\x00" * 12, width=2, height=2)
+        self.assertIn("no Jetson MMAPI", str(ctx.exception))
 
 
 class ComposeContractTests(unittest.TestCase):
@@ -219,6 +342,8 @@ class RgbContractTests(unittest.TestCase):
         self.assertIn("rgb = np.ascontiguousarray(head.bgr[:, :, ::-1])", src)
         self.assertIn("portal.send_video_frame(", src)
         self.assertIn("track, rgb", src)
+        self.assertIn("EncodeUnavailableError", src)
+        self.assertIn("raise SystemExit(1)", src)
 
         h, w = 8, 12
         bgr = np.zeros((h, w, 3), dtype=np.uint8)
