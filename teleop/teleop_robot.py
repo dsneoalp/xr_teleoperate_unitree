@@ -24,6 +24,7 @@ sys.path.append(parent_dir)
 
 from teleop.robot_control.portal_robot import PortalRobotTransport
 from teleop.robot_control.portal_mapping import UnpackedAction
+from teleop.robot_control.tick_slot import OneShotTickSlot, now_us
 from teleop.utils.loop_timing import LoopTiming
 from teleop.utils.arm_stiffness import ARM_STIFFNESS_FADE_S
 
@@ -34,6 +35,8 @@ FSM_HAND_SETUP = 3
 ACTION_TIMEOUT = 0.2
 IMAGE_CLIENT_RETRIES = 50
 IMAGE_CLIENT_RETRY_S = 0.1
+STATE_SKIP_LOG_EVERY = 30
+VIDEO_SKIP_LOG_EVERY = 30
 
 
 def interp_cmd(state, q_cmd, now, tau):
@@ -91,22 +94,35 @@ def _connect_image_client(host: str):
     return None
 
 
-def _video_publish_loop(img_client, portal, track, stop_evt, fps: float):
-    """Grab latest ZMQ frame and publish off the control loop. Drop-oldest: no queue."""
+def _video_publish_loop(img_client, portal, track, stop_evt, fps: float, tick_slot: OneShotTickSlot):
+    """Grab latest ZMQ frame and stamp it with the unused control-loop tick.
+
+    Does not wait for the next loop tick. No frame or empty slot: skip publish
+    and do not reuse a consumed timestamp.
+    """
     logged = False
+    skip_count = 0
     interval = 1.0 / max(fps, 1.0)
     while not stop_evt.is_set():
         t0 = time.time()
         try:
             head = img_client.get_head_frame()
-            if head is not None and getattr(head, "bgr", None) is not None:
+            has_frame = head is not None and getattr(head, "bgr", None) is not None
+            if has_frame:
                 rgb = np.ascontiguousarray(head.bgr[:, :, ::-1])
-                portal.send_video_frame(
-                    track, rgb, timestamp_us=int(time.time() * 1_000_000))
-                if not logged:
-                    h, w = rgb.shape[:2]
-                    logger_mp.info(f"publishing '{track}' {w}x{h} (video thread)")
-                    logged = True
+                ts = tick_slot.take()
+                if ts is not None:
+                    portal.send_video_frame(track, rgb, timestamp_us=ts)
+                    skip_count = 0
+                    if not logged:
+                        h, w = rgb.shape[:2]
+                        logger_mp.info(f"publishing '{track}' {w}x{h} (video thread)")
+                        logged = True
+                else:
+                    skip_count += 1
+                    if skip_count == 1 or skip_count % VIDEO_SKIP_LOG_EVERY == 0:
+                        logger_mp.debug(
+                            f"video skip: no pending tick_ts (skips={skip_count})")
         except Exception as exc:
             logger_mp.warning(f"video thread: {exc}")
         sleep = interval - (time.time() - t0)
@@ -116,7 +132,10 @@ def _video_publish_loop(img_client, portal, track, stop_evt, fps: float):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--frequency', type=float, default=30.0, help='state publish rate')
+    parser.add_argument(
+        '--frequency', type=float, default=30.0,
+        help='control-loop rate (Hz). With video, Portal state/frame publish '
+             'follows the slower of control and video; DDS still uses this rate.')
     parser.add_argument('--arm', type=str, choices=['G1_29'], default='G1_29')
     parser.add_argument('--ee', type=str, choices=['dex3'], default=None)
     parser.add_argument('--motion', action='store_true')
@@ -172,10 +191,12 @@ if __name__ == '__main__':
     video_track = portal.video_tracks[0] if portal.video_tracks else None
     video_stop = threading.Event()
     video_thread = None
+    tick_slot = None
     if img_client is not None and video_track:
+        tick_slot = OneShotTickSlot()
         video_thread = threading.Thread(
             target=_video_publish_loop,
-            args=(img_client, portal, video_track, video_stop, args.frequency),
+            args=(img_client, portal, video_track, video_stop, args.frequency, tick_slot),
             daemon=True)
         video_thread.start()
         logger_mp.info("video publish thread started")
@@ -191,6 +212,7 @@ if __name__ == '__main__':
     loco_stale = False
     operator_present = False
     had_operator = False
+    state_skips = 0
 
     def on_action(action: UnpackedAction):
         now = time.time()
@@ -287,7 +309,22 @@ if __name__ == '__main__':
 
             motor_q = arm_ctrl.get_current_motor_q()
             hand_q = hand_ctrl.get_current_dual_hand_q() if hand_ctrl is not None else None
-            portal.send_state(motor_q=motor_q, hand_q=hand_q, fsm_id=fsm)
+            tick_ts = now_us()
+            if tick_slot is None:
+                portal.send_state(motor_q=motor_q, hand_q=hand_q, fsm_id=fsm,
+                                  timestamp_us=tick_ts)
+            elif tick_slot.try_publish(tick_ts):
+                if state_skips:
+                    logger_mp.info(f"send_state resumed after {state_skips} skipped ticks")
+                    state_skips = 0
+                portal.send_state(motor_q=motor_q, hand_q=hand_q, fsm_id=fsm,
+                                  timestamp_us=tick_ts)
+            else:
+                state_skips += 1
+                if state_skips == 1 or state_skips % STATE_SKIP_LOG_EVERY == 0:
+                    logger_mp.info(
+                        f"send_state skipped, waiting for video to consume tick "
+                        f"(skips={state_skips})")
 
             sleep = max(0.0, (1.0 / args.frequency) - (time.time() - start))
             time.sleep(sleep)

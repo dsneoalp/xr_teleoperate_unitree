@@ -29,6 +29,7 @@ from teleop.utils.ipc import IPC_Server
 from sshkeyboard import listen_keyboard, stop_listening
 from teleop.robot_control.portal_operator import PortalTeleopBridge
 from teleop.utils.loop_timing import LoopTiming
+from teleop.utils.episode_item import colors_from_head, states_actions_from_pair
 from teleop.utils.dex3_pose_mapping import (
     load,
     pressed_from_tele_data,
@@ -218,6 +219,23 @@ if __name__ == '__main__':
                 task_steps=args.task_steps,
                 frequency=args.frequency,
                 rerun_log=not args.headless)
+            include_body = args.input_mode == "controller" and args.motion
+
+            def on_record_pair(pair):
+                if not RECORD_RUNNING:
+                    return
+                head = None
+                if teleop_bridge.xr_track:
+                    head = pair.obs.frames.get(teleop_bridge.xr_track)
+                colors = colors_from_head(head, camera_config)
+                states, actions = states_actions_from_pair(
+                    pair, include_body=include_body)
+                recorder.add_item(
+                    colors=colors, depths={}, states=states, actions=actions,
+                    timestamp_us=pair.obs.timestamp_us,
+                    action_timestamp_us=pair.action_timestamp_us)
+
+            teleop_bridge.on_record_pair(on_record_pair)
         
         # Setting up controller mapping to hands: Custom mapping will open a GUI
         if mapping_mode == "load":
@@ -317,8 +335,6 @@ if __name__ == '__main__':
         last_send_t = None
 
         head_img = None
-        left_wrist_img = None
-        right_wrist_img = None
         dex3_oc_s = 0.0
         dex3_oc_ramp = 0.0
         custom_current_q = None
@@ -334,26 +350,22 @@ if __name__ == '__main__':
 
             # Get frame from Livekit Portal 
             start_time = time.time()
-            if camera_config['head_camera']['enable_zmq']:
-                if args.record or xr_need_local_img:
-                    head_img = teleop_bridge.get_head_frame()
-                if xr_need_local_img and head_img is not None and head_img.bgr is not None:
+            if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
+                head_img = teleop_bridge.get_head_frame()
+                if head_img is not None and head_img.bgr is not None:
                     tv_wrapper.render_to_xr(head_img.bgr)
-            if camera_config['left_wrist_camera']['enable_zmq'] and args.record:
-                left_wrist_img = teleop_bridge.get_left_wrist_frame()
-            if camera_config['right_wrist_camera']['enable_zmq'] and args.record:
-                right_wrist_img = teleop_bridge.get_right_wrist_frame()
-
 
             if args.record and RECORD_TOGGLE:
                 RECORD_TOGGLE = False
                 if not RECORD_RUNNING:
                     if recorder.create_episode():
                         RECORD_RUNNING = True
+                        teleop_bridge.set_recording_enabled(True)
                     else:
                         logger_mp.error("Failed to create episode. Recording not started.")
                 else:
                     RECORD_RUNNING = False
+                    teleop_bridge.set_recording_enabled(False)
                     recorder.save_episode()
 
             # Get teleop data from TeleVuerWrapper
@@ -414,61 +426,8 @@ if __name__ == '__main__':
             # Send targets to robot via Livekit Portal
             teleop_bridge.send_targets(sol_q, hand_q=controller_hand_q, vx=vx, vy=vy, vyaw=vyaw, fsm_id=fsm)
 
-            # Record data
             if args.record:
                 READY = recorder.is_ready()
-                left_ee_state = []
-                right_ee_state = []
-                left_hand_action = []
-                right_hand_action = []
-                if args.ee == "dex3" and args.input_mode == "hand":
-                    with dual_hand_data_lock:
-                        left_ee_state = dual_hand_state_array[:7]
-                        right_ee_state = dual_hand_state_array[-7:]
-                        left_hand_action = dual_hand_action_array[:7]
-                        right_hand_action = dual_hand_action_array[-7:]
-                elif args.ee == "dex3" and args.input_mode == "controller":
-                    with dual_hand_data_lock:
-                        left_ee_state = dual_hand_state_array[:7]
-                        right_ee_state = dual_hand_state_array[-7:]
-                    if controller_hand_q is not None:
-                        left_hand_action = controller_hand_q[:7].tolist()
-                        right_hand_action = controller_hand_q[7:].tolist()
-                body_action = [vx, vy, vyaw] if args.input_mode == "controller" and args.motion else []
-                reported = teleop_bridge.get_reported_arm_q()
-                rec_q = reported if reported is not None else current_lr_arm_q
-                half = len(rec_q) // 2
-                left_arm_state, right_arm_state = rec_q[:half], rec_q[half:]
-                left_arm_action, right_arm_action = sol_q[:half], sol_q[half:]
-                if RECORD_RUNNING:
-                    colors = {}
-                    depths = {}
-                    if camera_config['head_camera']['binocular']:
-                        if head_img is not None and head_img.bgr is not None:
-                            w = camera_config['head_camera']['image_shape'][1] // 2
-                            colors["color_0"] = head_img.bgr[:, :w]
-                            colors["color_1"] = head_img.bgr[:, w:]
-                    elif head_img is not None and head_img.bgr is not None:
-                        colors["color_0"] = head_img.bgr
-                    if left_wrist_img is not None and left_wrist_img.bgr is not None:
-                        colors["color_2" if camera_config['head_camera']['binocular'] else "color_1"] = left_wrist_img.bgr
-                    if right_wrist_img is not None and right_wrist_img.bgr is not None:
-                        colors["color_3" if camera_config['head_camera']['binocular'] else "color_2"] = right_wrist_img.bgr
-                    states = {
-                        "left_arm": {"qpos": left_arm_state.tolist(), "qvel": [], "torque": []},
-                        "right_arm": {"qpos": right_arm_state.tolist(), "qvel": [], "torque": []},
-                        "left_ee": {"qpos": left_ee_state, "qvel": [], "torque": []},
-                        "right_ee": {"qpos": right_ee_state, "qvel": [], "torque": []},
-                        "body": {"qpos": []},
-                    }
-                    actions = {
-                        "left_arm": {"qpos": left_arm_action.tolist(), "qvel": [], "torque": []},
-                        "right_arm": {"qpos": right_arm_action.tolist(), "qvel": [], "torque": []},
-                        "left_ee": {"qpos": left_hand_action, "qvel": [], "torque": []},
-                        "right_ee": {"qpos": right_hand_action, "qvel": [], "torque": []},
-                        "body": {"qpos": body_action},
-                    }
-                    recorder.add_item(colors=colors, depths=depths, states=states, actions=actions)
 
             timing.add("loop_ms", (time.time() - start_time) * 1000.0)
             sleep_time = max(0, (1 / args.frequency) - (time.time() - start_time))
@@ -488,6 +447,11 @@ if __name__ == '__main__':
                 listen_keyboard_thread.join()
         except Exception as e:
             logger_mp.error(f"Failed to stop keyboard listener or ipc server: {e}")
+        try:
+            if args.record:
+                teleop_bridge.set_recording_enabled(False)
+        except Exception as e:
+            logger_mp.error(f"Failed to disable recording buffer: {e}")
         try:
             teleop_bridge.close()
         except Exception as e:

@@ -1,5 +1,10 @@
 # 🔖 Release Note
 
+## Portal tick sync (unreleased)
+
+- Robot control loop stamps each Portal `send_state` with a wall-clock `tick_ts`. With video enabled, a one-shot slot lets the video thread attach that same timestamp to exactly one `send_video_frame` without waiting on the loop. `--no-img` still publishes state every control tick.
+- Operator XR display stays on unmatched `on_video_frame`. Recording writes one episode item per observation, keyed by `in_reply_to_ts_us == timestamp_us`, and stores both `timestamp_us` (robot tick) and `action_timestamp_us` (operator send).
+
 ## 🏷️ v1.6 (2026.7.29)
 
 - Added support for the **H2** robot.

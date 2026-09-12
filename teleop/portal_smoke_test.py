@@ -120,6 +120,19 @@ def test_portal_roundtrip() -> None:
                 print("WARN portal video frame not received (state echo still OK)")
             else:
                 print(f"OK  portal video frame {frame.shape}")
+
+            if not bridge.last_obs_had_frames():
+                for _ in range(20):
+                    if bridge.last_obs_had_frames():
+                        break
+                    time.sleep(0.1)
+            obs_ts = bridge.get_last_obs_ts_us()
+            if obs_ts is None:
+                raise AssertionError("echo succeeded but observation timestamp_us is missing")
+            if not bridge.last_obs_had_frames():
+                print("WARN portal observation had no matched frames")
+            else:
+                print(f"OK  portal observation with frame ts={obs_ts}")
         finally:
             bridge.close()
     finally:

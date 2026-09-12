@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import os
 import sys
-import time
 import asyncio
 import threading
 
@@ -24,6 +23,7 @@ if parent2_dir not in sys.path:
 
 from teleop.robot_control.portal_mapping import PortalMapping
 from teleop.robot_control.portal_operator import mint_portal_token, _load_dotenv
+from teleop.robot_control.tick_slot import now_us
 
 
 class PortalRobotTransport:
@@ -119,7 +119,7 @@ class PortalRobotTransport:
 
     def send_state(self, motor_q=None, arm_q=None, hand_q=None, fsm_id=0, timestamp_us=None) -> None:
         values = self.mapping.pack_state(motor_q=motor_q, arm_q=arm_q, hand_q=hand_q, fsm_id=fsm_id)
-        ts = timestamp_us if timestamp_us is not None else int(time.time() * 1_000_000)
+        ts = timestamp_us if timestamp_us is not None else now_us()
         try:
             self._robot.send_state(values, timestamp_us=ts)
         except Exception as exc:

@@ -4,13 +4,13 @@ Used by teleop_operator.py (not as arm_ctrl):
 
   * IK arm targets, dex3 retargeting, and loco (vx/vy/vyaw) are published
     as Portal actions at the teleop control rate.
-  * Robot state is received via on_observation (joints only; video is
-    decoded on on_video_frame). IK warm-starts from last sent targets so
-    delayed WAN state does not oscillate the solver. Missing state still
-    dead-reckons with those targets.
+  * Robot state is received via on_observation. IK warm-starts from last
+    sent targets so delayed WAN state does not oscillate the solver.
+    Missing state still dead-reckons with those targets.
   * Video: every track listed under portal.yaml `videos:` is subscribed.
-    TeleVuer / get_head_frame() shows the first entry; extra tracks map
-    to left/right wrist in declaration order.
+    TeleVuer / get_head_frame() uses the unmatched on_video_frame path
+    (lowest display latency). Recording uses matched obs.frames from
+    on_observation, paired with send_action via in_reply_to_ts_us.
 
 No unitree_sdk2py import happens anywhere in this module.
 Joint names come from portal_mapping.yaml, not hardcoded tuples.
@@ -37,6 +37,12 @@ if parent2_dir not in sys.path:
     sys.path.append(parent2_dir)
 
 from teleop.robot_control.portal_mapping import PortalMapping
+from teleop.robot_control.obs_record_buffer import (
+    RecordingObservation,
+    RecordingPair,
+    RecordingObsBuffer,
+)
+from teleop.robot_control.tick_slot import now_us
 
 # ImageClient / TeleVuer slot names. Portal tracks bind by yaml order.
 _TELEVUER_SLOTS = ("head_camera", "left_wrist_camera", "right_wrist_camera")
@@ -196,6 +202,10 @@ class PortalTeleopBridge:
         self._frames = {}
         self._pending_action_wall = None
         self._rtt_cb = None
+        self._recording_enabled = False
+        self._rec_buf = RecordingObsBuffer()
+        self._record_pair_cb = None
+        self._last_obs_had_frames = False
 
         self._arm_lock = threading.Lock()
         self._q_target = np.zeros(arm_dof)
@@ -278,10 +288,14 @@ class PortalTeleopBridge:
             raw = getattr(obs, "state", None) or {}
         q_new = self._map.unpack_arm_q(raw)
         hand_new = self._map.unpack_hand_q(raw)
+        raw_frames = getattr(obs, "frames", None) or {}
+        had_frames = bool(raw_frames)
 
         rtt_ms = None
         with self._obs_lock:
             self._obs_ts_us = ts_us
+            self._last_obs_had_frames = had_frames
+            recording = self._recording_enabled
             if q_new is not None:
                 self._prev_state_q = q_new
                 self._prev_state_ts_us = ts_us
@@ -304,6 +318,20 @@ class PortalTeleopBridge:
                 n = min(len(self._dual_hand_state_array_out), hand_new.size)
                 self._dual_hand_state_array_out[:n] = hand_new[:n]
 
+        if recording and ts_us is not None:
+            rec_frames = {}
+            for track, frame in raw_frames.items():
+                stored = self._decode_video_frame(track, frame, log=False)
+                for name, wrapped in stored.items():
+                    if wrapped.bgr is not None:
+                        rec_frames[name] = np.ascontiguousarray(wrapped.bgr.copy())
+            self._rec_buf.push(RecordingObservation(
+                timestamp_us=int(ts_us),
+                arm_q=None if q_new is None else q_new.copy(),
+                hand_q=None if hand_new is None else hand_new.copy(),
+                frames=rec_frames,
+            ))
+
     def _on_video_frame(self, track: str, frame) -> None:
         stored = self._decode_video_frame(track, frame)
         if not stored:
@@ -320,7 +348,7 @@ class PortalTeleopBridge:
             return None
         return _TELEVUER_SLOTS[idx]
 
-    def _decode_video_frame(self, track: str, frame) -> dict:
+    def _decode_video_frame(self, track: str, frame, *, log: bool = True) -> dict:
         try:
             data = frame.data
             w, h = int(frame.width), int(frame.height)
@@ -335,7 +363,7 @@ class PortalTeleopBridge:
                     import cv2
                     bgr = cv2.resize(bgr, (ew, eh), interpolation=cv2.INTER_LINEAR)
             wrapped = _Frame(bgr, getattr(frame, "timestamp_us", 0) or 0)
-            if track not in self._frames_logged:
+            if log and track not in self._frames_logged:
                 self._frames_logged.add(track)
                 dest = "TeleVuer" if track == self._xr_track else (slot or "record")
                 logger_mp.info(f"[portal] video '{track}' {w}x{h} → {dest}")
@@ -384,17 +412,20 @@ class PortalTeleopBridge:
             vx, vy, vyaw = self._vx, self._vy, self._vyaw
         with self._obs_lock:
             in_reply_to = self._obs_ts_us
+        action_ts = now_us()
         values = self._map.pack_action(
             arm_q=q_arm, hand_q=hand_q, vx=vx, vy=vy, vyaw=vyaw, fsm_id=fsm_id)
         try:
             self._op.send_action(values,
-                                 timestamp_us=int(time.time() * 1_000_000),
+                                 timestamp_us=action_ts,
                                  in_reply_to_ts_us=in_reply_to)
         except Exception as exc:
             logger_mp.warning(f"[portal] send_action failed: {exc}")
             return
         with self._obs_lock:
             self._pending_action_wall = time.time()
+            recording = self._recording_enabled
+            record_cb = self._record_pair_cb
         now = time.time()
         with self._arm_lock:
             if self._last_send_wall > 0:
@@ -403,10 +434,63 @@ class PortalTeleopBridge:
                     self._last_sent_dq[:] = (q_arm - self._last_sent_q) / dt
             self._last_sent_q[:] = q_arm
             self._last_send_wall = now
+        if recording:
+            pair = self.take_recording_pair(
+                in_reply_to, action_ts, q_arm, hand_q, vx, vy, vyaw, fsm_id)
+            if pair is None:
+                logger_mp.debug(
+                    f"[portal] no recording obs for in_reply_to={in_reply_to}")
+            elif record_cb is not None:
+                try:
+                    record_cb(pair)
+                except Exception as exc:
+                    logger_mp.warning(f"[portal] record pair callback failed: {exc}")
 
     def on_rtt(self, callback) -> None:
         """callback(rtt_ms) on the first observation after a successful send_action."""
         self._rtt_cb = callback
+
+    def on_record_pair(self, callback) -> None:
+        """callback(RecordingPair) after a successful send_action while recording."""
+        self._record_pair_cb = callback
+
+    def set_recording_enabled(self, enabled: bool) -> None:
+        """Decode obs.frames into the recording buffer only while True."""
+        with self._obs_lock:
+            self._recording_enabled = bool(enabled)
+        if not enabled:
+            self._rec_buf.clear()
+        logger_mp.info(f"[portal] recording buffer {'on' if enabled else 'off'}")
+
+    def take_recording_pair(
+            self, in_reply_to_ts_us, action_ts, arm_action, hand_action,
+            vx, vy, vyaw, fsm_id) -> RecordingPair | None:
+        """Pop the observation that this action replied to. None if missing."""
+        obs = self._rec_buf.take(in_reply_to_ts_us)
+        if obs is None:
+            return None
+        return RecordingPair(
+            obs=obs,
+            action_timestamp_us=int(action_ts),
+            arm_action=np.asarray(arm_action, dtype=np.float64).copy(),
+            hand_action=np.asarray(hand_action, dtype=np.float64).copy(),
+            vx=float(vx),
+            vy=float(vy),
+            vyaw=float(vyaw),
+            fsm_id=int(fsm_id),
+        )
+
+    @property
+    def xr_track(self) -> str | None:
+        return self._xr_track
+
+    def get_last_obs_ts_us(self) -> int | None:
+        with self._obs_lock:
+            return self._obs_ts_us
+
+    def last_obs_had_frames(self) -> bool:
+        with self._obs_lock:
+            return self._last_obs_had_frames
 
     def state_age_ms(self) -> float | None:
         with self._obs_lock:

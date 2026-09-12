@@ -24,10 +24,15 @@ sys.path.append(parent_dir)
 
 from teleop.robot_control.portal_robot import PortalRobotTransport
 from teleop.robot_control.portal_mapping import UnpackedAction
+from teleop.robot_control.tick_slot import now_us
+
+MOCK_FRAME_HEIGHT = 480
+MOCK_FRAME_WIDTH = 640
+MOCK_ACTION_LOG_PERIOD_S = 1.0
 
 
 def _test_pattern(h: int, w: int, t: float) -> np.ndarray:
-    """RGB24 uint8 frame, 480x640-style, moving bar."""
+    """RGB24 uint8 frame with a moving bar."""
     y = np.linspace(0, 255, h, dtype=np.uint8)[:, None]
     x = np.linspace(0, 255, w, dtype=np.uint8)[None, :]
     frame = np.zeros((h, w, 3), dtype=np.uint8)
@@ -82,29 +87,29 @@ if __name__ == '__main__':
             with lock:
                 action = latest['action']
                 n = latest['count']
+            tick_ts = now_us()
             if action is not None:
-                portal.send_state(arm_q=action.arm_q, hand_q=action.hand_q, fsm_id=action.fsm_id)
+                portal.send_state(arm_q=action.arm_q, hand_q=action.hand_q,
+                                  fsm_id=action.fsm_id, timestamp_us=tick_ts)
             else:
-                portal.send_state(fsm_id=0)
+                portal.send_state(fsm_id=0, timestamp_us=tick_ts)
             if track:
-                rgb = _test_pattern(480, 640, now - t0)
-                portal.send_video_frame(track, rgb, timestamp_us=int(now * 1_000_000))
-            if now - last_log >= 1.0:
+                rgb = _test_pattern(MOCK_FRAME_HEIGHT, MOCK_FRAME_WIDTH, now - t0)
+                portal.send_video_frame(track, rgb, timestamp_us=tick_ts)
+            if now - last_log >= MOCK_ACTION_LOG_PERIOD_S:
                 rate = n - last_count
                 last_count = n
                 last_log = now
                 if action is None:
-                    print("[mock] 1Hz: waiting for actions (count=0)", flush=True)
+                    logger_mp.info("[mock] 1Hz: waiting for actions (count=0)")
                 else:
                     arm = action.arm_q
                     hand = action.hand_q
-                    print(
+                    logger_mp.info(
                         f"[mock] 1Hz: count={n} (+{rate}/s) fsm={action.fsm_id} "
                         f"vx={action.vx:.3f} vy={action.vy:.3f} vyaw={action.vyaw:.3f} "
                         f"L_SHOULDER_PITCH={arm[0]:.4f} R_SHOULDER_PITCH={arm[7]:.4f} "
-                        f"left_thumb_mcp={hand[0]:.4f}",
-                        flush=True,
-                    )
+                        f"left_thumb_mcp={hand[0]:.4f} tick_ts={tick_ts}")
             elapsed = time.time() - now
             time.sleep(max(0.0, (1.0 / args.fps) - elapsed))
     except KeyboardInterrupt:
