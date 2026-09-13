@@ -1,0 +1,94 @@
+# Local Docker / loopback Portal contract (same schema as portal.yaml).
+# Pass with --portal-yaml portal_local.yaml. Secrets stay in .env.local;
+# room name comes from LIVEKIT_ROOM. Tune fps/tolerance here without
+# touching the production contract.
+version: 1
+fps: 30
+slack: 2
+tolerance: 1.5
+state_reliable: false
+action_reliable: false
+reuse_stale_frames: false
+ping_ms: 1000
+videos:
+  # Byte-stream (not WebRTC). LiveKit --dev drops H264 packet trailers, and
+  # portal panics on missing user_timestamp — TeleVuer stays black.
+  - { name: head_camera, codec: mjpeg, quality: 90 }
+state:
+  - { name: L_LEG_HIP_PITCH, dtype: f32 }
+  - { name: L_LEG_HIP_ROLL, dtype: f32 }
+  - { name: L_LEG_HIP_YAW, dtype: f32 }
+  - { name: L_LEG_KNEE, dtype: f32 }
+  - { name: L_LEG_ANKLE_PITCH, dtype: f32 }
+  - { name: L_LEG_ANKLE_ROLL, dtype: f32 }
+  - { name: R_LEG_HIP_PITCH, dtype: f32 }
+  - { name: R_LEG_HIP_ROLL, dtype: f32 }
+  - { name: R_LEG_HIP_YAW, dtype: f32 }
+  - { name: R_LEG_KNEE, dtype: f32 }
+  - { name: R_LEG_ANKLE_PITCH, dtype: f32 }
+  - { name: R_LEG_ANKLE_ROLL, dtype: f32 }
+  - { name: WAIST_YAW, dtype: f32 }
+  - { name: WAIST_ROLL, dtype: f32 }
+  - { name: WAIST_PITCH, dtype: f32 }
+  - { name: L_SHOULDER_PITCH, dtype: f32 }
+  - { name: L_SHOULDER_ROLL, dtype: f32 }
+  - { name: L_SHOULDER_YAW, dtype: f32 }
+  - { name: L_ELBOW, dtype: f32 }
+  - { name: L_WRIST_ROLL, dtype: f32 }
+  - { name: L_WRIST_PITCH, dtype: f32 }
+  - { name: L_WRIST_YAW, dtype: f32 }
+  - { name: R_SHOULDER_PITCH, dtype: f32 }
+  - { name: R_SHOULDER_ROLL, dtype: f32 }
+  - { name: R_SHOULDER_YAW, dtype: f32 }
+  - { name: R_ELBOW, dtype: f32 }
+  - { name: R_WRIST_ROLL, dtype: f32 }
+  - { name: R_WRIST_PITCH, dtype: f32 }
+  - { name: R_WRIST_YAW, dtype: f32 }
+  - { name: left_thumb_mcp, dtype: f32 }
+  - { name: left_thumb_aux, dtype: f32 }
+  - { name: left_thumb_pip, dtype: f32 }
+  - { name: left_index_mcp, dtype: f32 }
+  - { name: left_index_pip, dtype: f32 }
+  - { name: left_middle_mcp, dtype: f32 }
+  - { name: left_middle_pip, dtype: f32 }
+  - { name: right_thumb_mcp, dtype: f32 }
+  - { name: right_thumb_aux, dtype: f32 }
+  - { name: right_thumb_pip, dtype: f32 }
+  - { name: right_index_mcp, dtype: f32 }
+  - { name: right_index_pip, dtype: f32 }
+  - { name: right_middle_mcp, dtype: f32 }
+  - { name: right_middle_pip, dtype: f32 }
+  - { name: fsm_id, dtype: i32 }
+action:
+  - { name: fsm_id, dtype: i32 }
+  - { name: vx, dtype: f32 }
+  - { name: vy, dtype: f32 }
+  - { name: vyaw, dtype: f32 }
+  - { name: L_SHOULDER_PITCH, dtype: f32 }
+  - { name: L_SHOULDER_ROLL, dtype: f32 }
+  - { name: L_SHOULDER_YAW, dtype: f32 }
+  - { name: L_ELBOW, dtype: f32 }
+  - { name: L_WRIST_ROLL, dtype: f32 }
+  - { name: L_WRIST_PITCH, dtype: f32 }
+  - { name: L_WRIST_YAW, dtype: f32 }
+  - { name: R_SHOULDER_PITCH, dtype: f32 }
+  - { name: R_SHOULDER_ROLL, dtype: f32 }
+  - { name: R_SHOULDER_YAW, dtype: f32 }
+  - { name: R_ELBOW, dtype: f32 }
+  - { name: R_WRIST_ROLL, dtype: f32 }
+  - { name: R_WRIST_PITCH, dtype: f32 }
+  - { name: R_WRIST_YAW, dtype: f32 }
+  - { name: left_thumb_mcp, dtype: f32 }
+  - { name: left_thumb_aux, dtype: f32 }
+  - { name: left_thumb_pip, dtype: f32 }
+  - { name: left_index_mcp, dtype: f32 }
+  - { name: left_index_pip, dtype: f32 }
+  - { name: left_middle_mcp, dtype: f32 }
+  - { name: left_middle_pip, dtype: f32 }
+  - { name: right_thumb_mcp, dtype: f32 }
+  - { name: right_thumb_aux, dtype: f32 }
+  - { name: right_thumb_pip, dtype: f32 }
+  - { name: right_index_mcp, dtype: f32 }
+  - { name: right_index_pip, dtype: f32 }
+  - { name: right_middle_mcp, dtype: f32 }
+  - { name: right_middle_pip, dtype: f32 }

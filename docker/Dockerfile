@@ -77,7 +77,7 @@ RUN python -c "from livekit.portal import OperatorConfig, RobotConfig; \
 
 # ----- mock: echo actions / test-pattern video, no Unitree SDK -----
 FROM base AS mock
-CMD ["python", "portal_robot_mock.py"]
+CMD ["python", "tests/portal_robot_mock.py"]
 
 # ----- robot: README 1.2 unitree_sdk2_python at a pinned commit -----
 # setup.py has no package_data for utils/lib/*.so; pip install git+… drops crc_*.so.

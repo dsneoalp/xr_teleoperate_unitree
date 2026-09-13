@@ -8,9 +8,10 @@ Used by teleop_operator.py (not as arm_ctrl):
     sent targets so delayed WAN state does not oscillate the solver.
     Missing state still dead-reckons with those targets.
   * Video: every track listed under portal.yaml `videos:` is subscribed.
-    TeleVuer / get_head_frame() uses the unmatched on_video_frame path
-    (lowest display latency). Recording uses matched obs.frames from
-    on_observation, paired with send_action via in_reply_to_ts_us.
+    TeleVuer / get_head_frame() is filled from unmatched on_video_frame
+    (lowest display latency) and from matched obs.frames, so XR still
+    updates when tick-synced frames never take the unmatched path.
+    Recording uses obs.frames paired with send_action via in_reply_to_ts_us.
 
 No unitree_sdk2py import happens anywhere in this module.
 Joint names come from portal_mapping.yaml, not hardcoded tuples.
@@ -58,11 +59,29 @@ class _Frame:
         self.timestamp_us = timestamp_us
 
 
+def _apply_env_file(env_file: str) -> None:
+    """Load KEY=VAL lines into os.environ without overriding existing keys."""
+    if not env_file or not os.path.isfile(env_file):
+        return
+    with open(env_file, encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key = key.strip()
+            if not key:
+                continue
+            val = val.strip().strip("'").strip('"')
+            os.environ.setdefault(key, val)
+
+
 def _load_dotenv(env_file: str) -> None:
     try:
         from dotenv import load_dotenv
     except ImportError:
-        raise SystemExit("python-dotenv is required for portal mode: pip install python-dotenv")
+        _apply_env_file(env_file)
+        return
     if env_file and os.path.isfile(env_file):
         load_dotenv(env_file, override=False)
 
@@ -208,18 +227,13 @@ class PortalTeleopBridge:
         self._last_obs_had_frames = False
 
         self._arm_lock = threading.Lock()
-        self._q_target = np.zeros(arm_dof)
         self._last_sent_q = np.zeros(arm_dof)
         self._last_sent_dq = np.zeros(arm_dof)
         self._last_send_wall = 0.0
-        self._send_pending = False
 
         self._hand_lock = threading.Lock()
         self._hand_q = np.zeros(hand_dof)
         self._fsm_id = 0
-        self._vx = 0.0
-        self._vy = 0.0
-        self._vyaw = 0.0
 
         self._stop_evt = threading.Event()
         self._connected_evt = threading.Event()
@@ -318,13 +332,15 @@ class PortalTeleopBridge:
                 n = min(len(self._dual_hand_state_array_out), hand_new.size)
                 self._dual_hand_state_array_out[:n] = hand_new[:n]
 
+        stored_all = {}
+        for track, frame in raw_frames.items():
+            stored_all.update(self._decode_video_frame(track, frame))
+        self._merge_display_frames(stored_all)
         if recording and ts_us is not None:
             rec_frames = {}
-            for track, frame in raw_frames.items():
-                stored = self._decode_video_frame(track, frame, log=False)
-                for name, wrapped in stored.items():
-                    if wrapped.bgr is not None:
-                        rec_frames[name] = np.ascontiguousarray(wrapped.bgr.copy())
+            for name, wrapped in stored_all.items():
+                if wrapped.bgr is not None:
+                    rec_frames[name] = np.ascontiguousarray(wrapped.bgr.copy())
             self._rec_buf.push(RecordingObservation(
                 timestamp_us=int(ts_us),
                 arm_q=None if q_new is None else q_new.copy(),
@@ -333,11 +349,24 @@ class PortalTeleopBridge:
             ))
 
     def _on_video_frame(self, track: str, frame) -> None:
-        stored = self._decode_video_frame(track, frame)
+        self._merge_display_frames(self._decode_video_frame(track, frame))
+
+    def _merge_display_frames(self, stored: dict) -> None:
+        """Write decoded frames into the TeleVuer cache.
+
+        Unmatched on_video_frame stays the low-latency path. Matched
+        obs.frames fill the same cache so get_head_frame() still works
+        when Portal never emits unmatched video. A newer timestamp is
+        never replaced by an older one.
+        """
         if not stored:
             return
         with self._obs_lock:
-            self._frames.update(stored)
+            for track, wrapped in stored.items():
+                existing = self._frames.get(track)
+                if (existing is None
+                        or int(wrapped.timestamp_us) >= int(existing.timestamp_us)):
+                    self._frames[track] = wrapped
 
     def _slot_for_track(self, track: str) -> str | None:
         try:
@@ -373,48 +402,28 @@ class PortalTeleopBridge:
             return {}
 
     def send_targets(self, arm_q, hand_q=None, vx=0.0, vy=0.0, vyaw=0.0, fsm_id=None) -> None:
-        """Publish the latest action (drop-oldest). Do not enqueue every pose."""
-        q = np.asarray(arm_q, dtype=np.float64).copy()
-        with self._arm_lock:
-            self._q_target[:] = q
-            already_pending = self._send_pending
-            self._send_pending = True
+        """Publish an action from the caller thread (sync, fire-and-forget)."""
+        if not self._connected_evt.is_set():
+            return
+        q_arm = np.asarray(arm_q, dtype=np.float64).reshape(-1).copy()
         with self._hand_lock:
             if hand_q is not None:
-                self._hand_q[:] = np.asarray(hand_q, dtype=np.float64).reshape(-1)
-            self._vx = float(vx)
-            self._vy = float(vy)
-            self._vyaw = float(vyaw)
-            if fsm_id is not None:
-                self._fsm_id = int(fsm_id)
-        if self._loop is None or not self._connected_evt.is_set():
-            with self._arm_lock:
-                self._send_pending = False
-            return
-        if already_pending:
-            return
-        try:
-            self._loop.call_soon_threadsafe(self._flush_action)
-        except RuntimeError:
-            with self._arm_lock:
-                self._send_pending = False
+                q_hand = np.asarray(hand_q, dtype=np.float64).reshape(-1).copy()
+            else:
+                q_hand = self._hand_q.copy()
+            if fsm_id is None:
+                fsm = self._fsm_id
+            else:
+                fsm = int(fsm_id)
+                self._fsm_id = fsm
+        self._send_action_now(q_arm, q_hand, float(vx), float(vy), float(vyaw), fsm)
 
-    def _flush_action(self) -> None:
-        with self._arm_lock:
-            self._send_pending = False
-            q = self._q_target.copy()
-        self._send_action_now(q)
-
-    def _send_action_now(self, q_arm: np.ndarray) -> None:
-        with self._hand_lock:
-            hand_q = self._hand_q.copy()
-            fsm_id = self._fsm_id
-            vx, vy, vyaw = self._vx, self._vy, self._vyaw
+    def _send_action_now(self, q_arm, q_hand, vx, vy, vyaw, fsm_id) -> None:
         with self._obs_lock:
             in_reply_to = self._obs_ts_us
         action_ts = now_us()
         values = self._map.pack_action(
-            arm_q=q_arm, hand_q=hand_q, vx=vx, vy=vy, vyaw=vyaw, fsm_id=fsm_id)
+            arm_q=q_arm, hand_q=q_hand, vx=vx, vy=vy, vyaw=vyaw, fsm_id=fsm_id)
         try:
             self._op.send_action(values,
                                  timestamp_us=action_ts,
@@ -436,7 +445,7 @@ class PortalTeleopBridge:
             self._last_send_wall = now
         if recording:
             pair = self.take_recording_pair(
-                in_reply_to, action_ts, q_arm, hand_q, vx, vy, vyaw, fsm_id)
+                in_reply_to, action_ts, q_arm, q_hand, vx, vy, vyaw, fsm_id)
             if pair is None:
                 logger_mp.debug(
                     f"[portal] no recording obs for in_reply_to={in_reply_to}")

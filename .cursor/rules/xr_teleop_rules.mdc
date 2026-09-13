@@ -1,0 +1,6 @@
+---
+alwaysApply: false
+---
+- Include a docker setup for local debugging in the livekit portal setting.
+- Tests should be end to end, meaning the tests should create a mock operator and a mock robot and test wheather the exchange of images/states and frames are right and as expected, within the same controll paradigm as in the usual setting. Do write these mockers once do not always come up with new testing scripts.
+- After every code iteration a test should be done with the docker setup, that checks the communication between operator and robot.

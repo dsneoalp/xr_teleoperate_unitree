@@ -25,3 +25,4 @@ episode_0*
 *.pkl
 # LiveKit Portal credentials (portal mode)
 teleop/.env
+teleop/.env.local

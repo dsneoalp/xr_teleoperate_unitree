@@ -1,9 +1,9 @@
-"""Echo Portal robot for LiveKit smoke tests (no Unitree SDK).
+"""Echo Portal robot for LiveKit tests (no Unitree SDK).
 
 Receives actions, publishes them back as state, and streams a test pattern
-on the first portal.yaml video track.
+on the first portal.yaml video track. State and video share one `tick_ts`.
 
-    python teleop/portal_robot_mock.py --duration 20
+    python teleop/tests/portal_robot_mock.py --duration 20
 """
 from __future__ import annotations
 
@@ -13,14 +13,16 @@ import sys
 import time
 import threading
 
+_repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _repo_root not in sys.path:
+    sys.path.insert(0, _repo_root)
+
 import numpy as np
 import logging_mp
 logging_mp.basicConfig(level=logging_mp.INFO)
 logger_mp = logging_mp.getLogger(__name__)
 
-current_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.dirname(current_dir)
-sys.path.append(parent_dir)
+from teleop.tests.paths import ENV_FILE, PORTAL_MAPPING, PORTAL_YAML, REPO_ROOT
 
 from teleop.robot_control.portal_robot import PortalRobotTransport
 from teleop.robot_control.portal_mapping import UnpackedAction
@@ -43,18 +45,22 @@ def _test_pattern(h: int, w: int, t: float) -> np.ndarray:
     return frame
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--duration', type=float, default=0.0, help='seconds then exit; 0 = until Ctrl-C')
+def parse_args(argv=None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Echo Portal robot: actions as state plus test-pattern video.")
+    parser.add_argument('--duration', type=float, default=0.0,
+                        help='seconds then exit; 0 = until Ctrl-C')
     parser.add_argument('--fps', type=float, default=30.0)
-    parser.add_argument('--portal-yaml', type=str, default=os.path.join(current_dir, 'portal.yaml'))
-    parser.add_argument('--portal-mapping', type=str, default=os.path.join(current_dir, 'portal_mapping.yaml'))
-    parser.add_argument('--env-file', type=str, default=os.path.join(current_dir, '.env'))
+    parser.add_argument('--portal-yaml', type=str, default=PORTAL_YAML)
+    parser.add_argument('--portal-mapping', type=str, default=PORTAL_MAPPING)
+    parser.add_argument('--env-file', type=str, default=ENV_FILE)
     parser.add_argument('--livekit-url', type=str, default=None)
     parser.add_argument('--livekit-room', type=str, default=None)
     parser.add_argument('--portal-identity', type=str, default='xr-robot-mock')
-    args = parser.parse_args()
+    return parser.parse_args(argv)
 
+
+def run(args: argparse.Namespace) -> int:
     portal = PortalRobotTransport(
         portal_yaml=args.portal_yaml,
         mapping_yaml=args.portal_mapping,
@@ -74,7 +80,9 @@ if __name__ == '__main__':
 
     portal.on_unpacked_action(on_action)
     track = portal.video_tracks[0] if portal.video_tracks else None
-    logger_mp.info(f"[mock] echoing actions as state; video={track!r}; logging incoming actions at 1 Hz")
+    logger_mp.info(
+        f"[mock-robot] echoing actions as state; video={track!r}; "
+        "logging incoming actions at 1 Hz")
 
     t0 = time.time()
     last_log = 0.0
@@ -101,19 +109,29 @@ if __name__ == '__main__':
                 last_count = n
                 last_log = now
                 if action is None:
-                    logger_mp.info("[mock] 1Hz: waiting for actions (count=0)")
+                    logger_mp.info("[mock-robot] 1Hz: waiting for actions (count=0)")
                 else:
                     arm = action.arm_q
                     hand = action.hand_q
                     logger_mp.info(
-                        f"[mock] 1Hz: count={n} (+{rate}/s) fsm={action.fsm_id} "
+                        f"[mock-robot] 1Hz: count={n} (+{rate}/s) fsm={action.fsm_id} "
                         f"vx={action.vx:.3f} vy={action.vy:.3f} vyaw={action.vyaw:.3f} "
                         f"L_SHOULDER_PITCH={arm[0]:.4f} R_SHOULDER_PITCH={arm[7]:.4f} "
                         f"left_thumb_mcp={hand[0]:.4f} tick_ts={tick_ts}")
             elapsed = time.time() - now
             time.sleep(max(0.0, (1.0 / args.fps) - elapsed))
     except KeyboardInterrupt:
-        logger_mp.info("[mock] interrupt")
+        logger_mp.info("[mock-robot] interrupt")
+        return 130
     finally:
         portal.close()
-        logger_mp.info("[mock] exit")
+        logger_mp.info("[mock-robot] exit")
+    return 0
+
+
+def main(argv=None) -> int:
+    return run(parse_args(argv))
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

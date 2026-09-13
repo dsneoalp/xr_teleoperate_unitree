@@ -4,6 +4,8 @@
 #   docker compose -f docker/compose.yml up mock
 #   docker compose -f docker/compose.yml run --rm -it operator
 #
+# Local LiveKit + portal_local.yaml: docker/compose.local.yml and docker/README.md
+
 # teleop/ is bind-mounted so host edits apply on container restart (no rebuild).
 # New pip deps or Dockerfile changes still need: docker compose -f docker/compose.yml build
 

@@ -1,0 +1,86 @@
+# Local overlay: LiveKit --dev + portal_local.yaml + .env.local
+# Linux host network so ws://127.0.0.1:7880 works from every service.
+#
+#   cp teleop/.env.local.example teleop/.env.local
+#   docker compose -f docker/compose.yml -f docker/compose.local.yml build mock
+#   docker compose -f docker/compose.yml -f docker/compose.local.yml up livekit mock operator-mock
+# Isaac Lab: up livekit, then run robot (--sim) and operator; do not start mock.
+
+x-local-env: &local-env
+  env_file:
+    - ../teleop/.env.local
+  environment:
+    PYTHONUNBUFFERED: "1"
+
+services:
+  livekit:
+    image: livekit/livekit-server:v1.8.4
+    network_mode: host
+    command: ["--dev", "--bind", "0.0.0.0"]
+    restart: unless-stopped
+
+  mock:
+    <<: *local-env
+    command:
+      - python
+      - tests/portal_robot_mock.py
+      - --portal-yaml
+      - portal_local.yaml
+      - --env-file
+      - .env.local
+    depends_on:
+      - livekit
+    restart: on-failure
+
+  operator-mock:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: mock
+    image: xr-teleop:mock
+    network_mode: host
+    <<: *local-env
+    volumes:
+      - ../teleop:/app/teleop
+    stdin_open: true
+    tty: true
+    command:
+      - python
+      - tests/portal_operator_mock.py
+      - --portal-yaml
+      - portal_local.yaml
+      - --env-file
+      - .env.local
+    depends_on:
+      - livekit
+      - mock
+    restart: on-failure
+
+  operator:
+    <<: *local-env
+    command:
+      - --arm
+      - G1_29
+      - --ee
+      - dex3
+      - --input-mode
+      - hand
+      - --portal-yaml
+      - portal_local.yaml
+      - --env-file
+      - .env.local
+
+  robot:
+    <<: *local-env
+    command:
+      - python
+      - teleop_robot.py
+      - --ee
+      - dex3
+      - --arm
+      - G1_29
+      - --portal-yaml
+      - portal_local.yaml
+      - --env-file
+      - .env.local
+      - --sim
