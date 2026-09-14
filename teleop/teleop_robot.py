@@ -95,25 +95,40 @@ def _connect_image_client(host: str):
     return None
 
 
-def _video_publish_loop(img_client, portal, track, stop_evt, tick_slot: LatestTickSlot):
+def _video_publish_loop(img_client, portal, track, stop_evt, tick_slot: LatestTickSlot,
+                       timing: LoopTiming | None = None):
     """Wait for a control-loop tick, grab the latest ZMQ frame, stamp it once.
 
     Pacing comes from the control loop via the slot, not a second 1/fps sleep.
     No frame: the consumed timestamp is not reused; Portal drops or matches
     that state without a frame.
+
+    ``[timing-video]`` (1 Hz): ``grab_ms`` is ZMQ get_head_frame; ``encode_ms``
+    is the blocking ``send_video_frame`` (H264 + LiveKit); ``video_gap_ms`` is
+    start-to-start interval of successful publishes (~1000 / p50 = video Hz).
     """
     logged = False
     skip_count = 0
+    timing = timing or LoopTiming(logger_mp, prefix="[timing-video]")
+    last_encode_t = None
     while not stop_evt.is_set():
         ts = tick_slot.wait_take(timeout=VIDEO_WAIT_S)
         if ts is None:
             continue
         try:
+            grab_t0 = time.perf_counter()
             head = img_client.get_head_frame()
+            grab_ms = (time.perf_counter() - grab_t0) * 1000.0
             has_frame = head is not None and getattr(head, "bgr", None) is not None
             if has_frame:
                 rgb = np.ascontiguousarray(head.bgr[:, :, ::-1])
+                encode_t0 = time.perf_counter()
+                if last_encode_t is not None:
+                    timing.add("video_gap_ms", (encode_t0 - last_encode_t) * 1000.0)
+                last_encode_t = encode_t0
                 portal.send_video_frame(track, rgb, timestamp_us=ts)
+                timing.add("grab_ms", grab_ms)
+                timing.add("encode_ms", (time.perf_counter() - encode_t0) * 1000.0)
                 skip_count = 0
                 if not logged:
                     h, w = rgb.shape[:2]

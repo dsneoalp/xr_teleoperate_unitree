@@ -27,6 +27,7 @@ from teleop.tests.paths import ENV_FILE, PORTAL_MAPPING, PORTAL_YAML
 
 from teleop.robot_control.portal_mapping import PortalMapping
 from teleop.robot_control.portal_operator import PortalTeleopBridge
+from teleop.utils.episode_hz import format_hz, hz_from_timestamps
 
 ECHO_ATOL = 1e-3
 LOG_PERIOD_S = 1.0
@@ -85,7 +86,13 @@ def run(args: argparse.Namespace) -> int:
         last_log = 0.0
         echoed = False
         saw_frame = False
+        send_n = 0
+        obs_ts: list[int] = []
+        last_obs_ts = None
+        pair_ts: list[int] = []
         interval = 1.0 / max(args.fps, 1.0)
+        bridge.set_recording_enabled(True)
+        bridge.on_record_pair(lambda pair: pair_ts.append(int(pair.obs.timestamp_us)))
         while True:
             now = time.time()
             if args.duration > 0 and (now - t0) >= args.duration:
@@ -94,6 +101,11 @@ def run(args: argparse.Namespace) -> int:
             bridge.send_targets(
                 arm, hand_q=hand, vx=SEND_VX, vy=SEND_VY, vyaw=SEND_VYAW,
                 fsm_id=SEND_FSM_ID)
+            send_n += 1
+            ts = bridge.get_last_obs_ts_us()
+            if ts is not None and ts != last_obs_ts:
+                obs_ts.append(int(ts))
+                last_obs_ts = ts
             reported = bridge.get_reported_arm_q()
             if reported is not None and np.allclose(reported, arm, atol=ECHO_ATOL):
                 echoed = True
@@ -117,6 +129,16 @@ def run(args: argparse.Namespace) -> int:
             sleep = interval - (time.time() - loop_t0)
             if sleep > 0:
                 time.sleep(sleep)
+        elapsed = max(time.time() - t0, 1e-6)
+        logger_mp.info(
+            f"[mock-op] Hz: sends={send_n} send={send_n / elapsed:.2f} Hz  "
+            f"unique_obs={len(obs_ts)}")
+        logger_mp.info(format_hz("obs timestamp_us", hz_from_timestamps(obs_ts)))
+        logger_mp.info(format_hz("record pair", hz_from_timestamps(pair_ts)))
+        try:
+            bridge.set_recording_enabled(False)
+        except Exception:
+            pass
         if args.expect_echo:
             logger_mp.error(
                 f"[mock-op] timeout: echoed={echoed} xr_frame={saw_frame} "

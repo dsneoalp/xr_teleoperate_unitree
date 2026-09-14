@@ -61,6 +61,7 @@ def _video_bridge() -> PortalTeleopBridge:
     bridge._rtt_cb = None
     bridge._dual_hand_state_array_out = None
     bridge._dual_hand_data_lock = None
+    bridge._match_timing = None
     return bridge
 
 
@@ -122,3 +123,32 @@ def test_recording_skips_observation_without_frames():
     bridge._on_observation(_FakeObs(7, {}))
     assert bridge.get_last_obs_ts_us() == 7
     assert bridge._rec_buf.take(7) is None
+
+
+class _CountTiming:
+    def __init__(self):
+        self.counts: dict[str, int] = {}
+
+    def count(self, name: str, n: int = 1) -> None:
+        self.counts[name] = self.counts.get(name, 0) + n
+
+
+def test_match_timing_counts_obs_drops_and_unmatched_video():
+    bridge = _video_bridge()
+    timing = _CountTiming()
+    bridge._match_timing = timing
+    rgb = _solid_rgb(1, 2, 3)
+    bridge._on_video_frame(TRACK, _FakeFrame(rgb, 1))
+    bridge._on_observation(_FakeObs(10, {TRACK: _FakeFrame(rgb, 10)}))
+    bridge._on_observation(_FakeObs(11, {}))
+    bridge._on_drop([{"q": 0.0}, {"q": 1.0}])
+    assert timing.counts["unmatched_video"] == 1
+    assert timing.counts["obs"] == 2
+    assert timing.counts["obs_framed"] == 1
+    assert timing.counts["drop"] == 2
+
+
+def test_drop_n_accepts_list_and_int():
+    assert PortalTeleopBridge._drop_n([1, 2, 3]) == 3
+    assert PortalTeleopBridge._drop_n(4) == 4
+    assert PortalTeleopBridge._drop_n(None) == 0

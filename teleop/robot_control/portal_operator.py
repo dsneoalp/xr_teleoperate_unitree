@@ -46,6 +46,7 @@ from teleop.robot_control.obs_record_buffer import (
     record_buffer_maxlen,
 )
 from teleop.robot_control.tick_slot import now_us
+from teleop.utils.loop_timing import LoopTiming
 
 # ImageClient / TeleVuer slot names. Portal tracks bind by yaml order.
 _TELEVUER_SLOTS = ("head_camera", "left_wrist_camera", "right_wrist_camera")
@@ -205,10 +206,11 @@ class PortalTeleopBridge:
         cfg = OperatorConfig.from_yaml_file(portal_yaml, self._room)
         self._op = Operator(cfg)
         self._op.on_observation(self._on_observation)
-        self._op.on_drop(lambda drops: logger_mp.debug(f"[portal] dropped states: {len(drops)}"))
+        self._op.on_drop(self._on_drop)
         for track in self._declared_videos:
             self._op.on_video_frame(track, self._on_video_frame)
         self._frames_logged = set()
+        self._match_timing = LoopTiming(logger_mp, prefix="[timing-match]")
 
         arm_dof = self._map.arm_dof
         hand_dof = self._map.hand_dof
@@ -297,6 +299,28 @@ class PortalTeleopBridge:
             msg = self._connect_error or "timeout"
             raise RuntimeError(f"[portal] operator failed to connect: {msg}")
 
+    def _count_match(self, name: str, n: int = 1) -> None:
+        timing = getattr(self, "_match_timing", None)
+        if timing is not None and n:
+            timing.count(name, n)
+
+    @staticmethod
+    def _drop_n(drops) -> int:
+        if drops is None:
+            return 0
+        if isinstance(drops, int):
+            return max(0, drops)
+        try:
+            return len(drops)
+        except TypeError:
+            return 1
+
+    def _on_drop(self, drops) -> None:
+        n = self._drop_n(drops)
+        self._count_match("drop", n)
+        if n:
+            logger_mp.info(f"[portal] dropped states: {n}")
+
     def _on_observation(self, obs) -> None:
         ts_us = getattr(obs, "timestamp_us", None)
         wall = time.time()
@@ -307,6 +331,9 @@ class PortalTeleopBridge:
         hand_new = self._map.unpack_hand_q(raw)
         raw_frames = getattr(obs, "frames", None) or {}
         had_frames = bool(raw_frames)
+        self._count_match("obs")
+        if had_frames:
+            self._count_match("obs_framed")
 
         rtt_ms = None
         with self._obs_lock:
@@ -354,6 +381,8 @@ class PortalTeleopBridge:
             self._obs_ts_us = ts_us
 
     def _on_video_frame(self, track: str, frame) -> None:
+        if track == getattr(self, "_xr_track", None):
+            self._count_match("unmatched_video")
         self._merge_display_frames(self._decode_video_frame(track, frame))
 
     def _merge_display_frames(self, stored: dict) -> None:
