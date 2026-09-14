@@ -65,6 +65,18 @@ class _Frame:
         self.timestamp_us = timestamp_us
 
 
+def _rgb_from_portal_data(data, h: int, w: int) -> np.ndarray:
+    """View Portal RGB bytes without an extra `bytes()` copy when possible."""
+    if isinstance(data, np.ndarray):
+        rgb = data
+        if rgb.shape != (h, w, 3):
+            rgb = rgb.reshape(h, w, 3)
+        return np.ascontiguousarray(rgb, dtype=np.uint8)
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        data = bytes(data)
+    return np.frombuffer(data, dtype=np.uint8).reshape(h, w, 3)
+
+
 def _apply_env_file(env_file: str) -> None:
     """Load KEY=VAL lines into os.environ without overriding existing keys."""
     if not env_file or not os.path.isfile(env_file):
@@ -210,8 +222,17 @@ class PortalTeleopBridge:
         self._op = Operator(cfg)
         self._op.on_observation(self._on_observation)
         self._op.on_drop(self._on_drop)
-        for track in self._declared_videos:
-            self._op.on_video_frame(track, self._on_video_frame)
+        self._subscribe_unmatched_video = bool(
+            self._cam_config_raw.get("subscribe_unmatched_video", False))
+        if self._subscribe_unmatched_video:
+            for track in self._declared_videos:
+                self._op.on_video_frame(track, self._on_video_frame)
+            logger_mp.info(
+                f"[portal] on_video_frame subscribed for {self._declared_videos}")
+        else:
+            logger_mp.info(
+                "[portal] on_video_frame off; TeleVuer and record use obs.frames "
+                "(set subscribe_unmatched_video: true to restore the low-latency path)")
         self._frames_logged = set()
         self._match_timing = LoopTiming(logger_mp, prefix="[timing-match]")
         self._stamp_log_n = 0
@@ -220,10 +241,6 @@ class PortalTeleopBridge:
         self._unmatched_seen = False
         self._unmatched_logged = False
         self._last_metrics_log = 0.0
-        logger_mp.info(
-            f"[portal] on_video_frame subscribed for {self._declared_videos}; "
-            "idle is normal if unified sampling delivers frames only in "
-            "obs.frames")
 
         arm_dof = self._map.arm_dof
         hand_dof = self._map.hand_dof
@@ -236,6 +253,7 @@ class PortalTeleopBridge:
         self._prev_state_ts_us = None
         self._obs_ts_us = None
         self._frames = {}
+        self._decode_cache = {}
         self._pending_action_wall = None
         self._rtt_cb = None
         self._recording_enabled = False
@@ -405,10 +423,11 @@ class PortalTeleopBridge:
         n = self._drop_n(drops)
         self._count_match("drop", n)
         if n:
-            logger_mp.info(f"[portal] dropped states: {n}")
+            logger_mp.debug(f"[portal] dropped states: {n}")
         self._maybe_log_portal_metrics()
 
     def _on_observation(self, obs) -> None:
+        cb_t0 = time.perf_counter()
         ts_us = getattr(obs, "timestamp_us", None)
         wall = time.time()
         raw = getattr(obs, "raw_state", None)
@@ -455,6 +474,7 @@ class PortalTeleopBridge:
             stored_all.update(self._decode_video_frame(track, frame))
         self._merge_display_frames(stored_all)
         if recording and ts_us is not None:
+            rec_t0 = time.perf_counter()
             rec_frames = {}
             for name, wrapped in stored_all.items():
                 if wrapped.bgr is not None:
@@ -466,8 +486,10 @@ class PortalTeleopBridge:
                     hand_q=None if hand_new is None else hand_new.copy(),
                     frames=rec_frames,
                 ))
+            self._add_match("rec_copy_ms", (time.perf_counter() - rec_t0) * 1000.0)
         with self._obs_lock:
             self._obs_ts_us = ts_us
+        self._add_match("obs_cb_ms", (time.perf_counter() - cb_t0) * 1000.0)
 
     def _on_video_frame(self, track: str, frame) -> None:
         self._unmatched_seen = True
@@ -507,20 +529,34 @@ class PortalTeleopBridge:
         return _TELEVUER_SLOTS[idx]
 
     def _decode_video_frame(self, track: str, frame, *, log: bool = True) -> dict:
+        """RGB→BGR once per (track, timestamp_us). Unmatched + obs.frames share the cache."""
+        t0 = time.perf_counter()
+        hit = False
         try:
+            ts = int(getattr(frame, "timestamp_us", 0) or 0)
+            with self._obs_lock:
+                cached = self._decode_cache.get(track)
+                cached_frame = cached[1] if cached is not None and cached[0] == ts else None
+            if cached_frame is not None:
+                hit = True
+                self._count_match("decode_hit")
+                return {track: cached_frame}
             data = frame.data
             w, h = int(frame.width), int(frame.height)
             if data is None or not w or not h:
                 return {}
-            rgb = np.frombuffer(bytes(data), dtype=np.uint8).reshape(h, w, 3)
-            bgr = np.ascontiguousarray(rgb[:, :, ::-1])
+            rgb = _rgb_from_portal_data(data, h, w)
+            import cv2
+            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
             slot = self._slot_for_track(track)
             if slot and slot in self._expected_hw:
                 eh, ew = self._expected_hw[slot]
                 if (h, w) != (eh, ew):
-                    import cv2
                     bgr = cv2.resize(bgr, (ew, eh), interpolation=cv2.INTER_LINEAR)
-            wrapped = _Frame(bgr, getattr(frame, "timestamp_us", 0) or 0)
+            wrapped = _Frame(bgr, ts)
+            with self._obs_lock:
+                self._decode_cache[track] = (ts, wrapped)
+            self._count_match("decode_miss")
             if log and track not in self._frames_logged:
                 self._frames_logged.add(track)
                 dest = "TeleVuer" if track == self._xr_track else (slot or "record")
@@ -529,6 +565,9 @@ class PortalTeleopBridge:
         except Exception as exc:
             logger_mp.warning(f"[portal] failed to decode frame '{track}': {exc}")
             return {}
+        finally:
+            if not hit:
+                self._add_match("decode_ms", (time.perf_counter() - t0) * 1000.0)
 
     def send_targets(self, arm_q, hand_q=None, vx=0.0, vy=0.0, vyaw=0.0, fsm_id=None) -> None:
         """Publish an action from the caller thread (sync, fire-and-forget)."""
@@ -744,6 +783,15 @@ class PortalTeleopBridge:
                 cam_config[slot]["enable_webrtc"] = False
             logger_mp.info(f"[portal] yaml video[{i}] '{track}' → {slot}")
         return cam_config
+
+    @property
+    def xr_display_fps(self) -> float:
+        """TeleVuer JPEG rate. Recording still follows portal.yaml `fps`."""
+        try:
+            fps = float(self._cam_config_raw.get("xr_display_fps") or 15.0)
+        except (TypeError, ValueError):
+            fps = 15.0
+        return max(1.0, fps)
 
     def _get_frame_at(self, index: int):
         if index >= len(self._declared_videos):

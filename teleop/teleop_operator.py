@@ -102,11 +102,25 @@ def get_state() -> dict:
     }
 
 
+def _push_head_to_xr(tv_wrapper, head_img, last_t, min_dt, timing=None):
+    """Rate-limit TeleVuer SHM writes so JPEG in the Vuer process stays off the Portal path."""
+    now = time.perf_counter()
+    if now - last_t < min_dt:
+        return last_t
+    if head_img is None or getattr(head_img, "bgr", None) is None:
+        return last_t
+    t0 = time.perf_counter()
+    tv_wrapper.render_to_xr(head_img.bgr)
+    if timing is not None:
+        timing.add("xr_render_ms", (time.perf_counter() - t0) * 1000.0)
+    return now
+
+
 
 if __name__ == '__main__':
     # Parse arguments
     parser = argparse.ArgumentParser()
-    parser.add_argument('--frequency', type=float, default=60.0)
+    parser.add_argument('--frequency', type=float, default=30.0)
     parser.add_argument('--input-mode', type=str, choices=['hand', 'controller'], default='hand')
     parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive')
     parser.add_argument('--arm', type=str, choices=['G1_29'], default='G1_29')
@@ -121,6 +135,8 @@ if __name__ == '__main__':
                         default=os.path.join(current_dir, 'hand_pose_session.yaml'),
                         help='YAML path for --custom_mapping (load if present, else GUI writes it)')
     parser.add_argument('--headless', action='store_true')
+    parser.add_argument('--rerun', action='store_true',
+                        help='Stream recorded items to a Rerun viewer (off by default)')
     parser.add_argument('--ipc', action='store_true')
     parser.add_argument('--record', action='store_true')
     parser.add_argument('--task-dir', type=str, default='./utils/data/')
@@ -193,12 +209,17 @@ if __name__ == '__main__':
 
         xr_need_local_img = not (
             args.display_mode == 'pass-through' or camera_config['head_camera']['enable_webrtc'])
+        xr_display_fps = teleop_bridge.xr_display_fps
+        xr_dt = 1.0 / xr_display_fps
+        last_xr_t = 0.0
+        logger_mp.info(f"[portal] TeleVuer display_fps={xr_display_fps:.0f}")
 
         # Initialize TeleVuerWrapper (XR display)
         tv_wrapper = TeleVuerWrapper(
             use_hand_tracking=args.input_mode == "hand",
             binocular=camera_config['head_camera']['binocular'],
             img_shape=camera_config['head_camera']['image_shape'],
+            display_fps=xr_display_fps,
             display_mode=args.display_mode,
             zmq=camera_config['head_camera']['enable_zmq'],
             webrtc=camera_config['head_camera']['enable_webrtc'],
@@ -218,7 +239,7 @@ if __name__ == '__main__':
                 task_desc=args.task_desc,
                 task_steps=args.task_steps,
                 frequency=args.frequency,
-                rerun_log=not args.headless)
+                rerun_log=bool(args.rerun) and not args.headless)
             include_body = args.input_mode == "controller" and args.motion
 
             def on_record_pair(pair):
@@ -278,8 +299,8 @@ if __name__ == '__main__':
                     tick = time.time()
                     if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
                         head_img = teleop_bridge.get_head_frame()
-                        if head_img.bgr is not None:
-                            tv_wrapper.render_to_xr(head_img.bgr)
+                        last_xr_t = _push_head_to_xr(
+                            tv_wrapper, head_img, last_xr_t, xr_dt)
                     teleop_bridge.send_targets(
                         hold_arm,
                         hand_q=gui_state.get_q(),
@@ -323,8 +344,8 @@ if __name__ == '__main__':
                 time.sleep(0.033)
                 if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
                     head_img = teleop_bridge.get_head_frame()
-                    if head_img.bgr is not None:
-                        tv_wrapper.render_to_xr(head_img.bgr)
+                    last_xr_t = _push_head_to_xr(
+                        tv_wrapper, head_img, last_xr_t, xr_dt)
 
         if not STOP:
             logger_mp.info("start Tracking")
@@ -351,9 +372,11 @@ if __name__ == '__main__':
             # Get frame from Livekit Portal 
             start_time = time.time()
             if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
+                t_xr_get = time.perf_counter()
                 head_img = teleop_bridge.get_head_frame()
-                if head_img is not None and head_img.bgr is not None:
-                    tv_wrapper.render_to_xr(head_img.bgr)
+                timing.add("xr_get_ms", (time.perf_counter() - t_xr_get) * 1000.0)
+                last_xr_t = _push_head_to_xr(
+                    tv_wrapper, head_img, last_xr_t, xr_dt, timing=timing)
 
             if args.record and RECORD_TOGGLE:
                 RECORD_TOGGLE = False
@@ -369,6 +392,7 @@ if __name__ == '__main__':
                     recorder.save_episode()
 
             # Get teleop data from TeleVuerWrapper
+            t_tele = time.perf_counter()
             tele_data = tv_wrapper.get_tele_data()
             controller_hand_q = None
             if args.ee == "dex3" and args.input_mode == "hand":
@@ -391,6 +415,7 @@ if __name__ == '__main__':
                     controller_hand_q = dex3_oc_hand_q(dex3_oc_s)
             with xr_motion_data_ready.get_lock():
                 xr_motion_data_ready.value = tele_data.motion_data_ready
+            timing.add("tele_ms", (time.perf_counter() - t_tele) * 1000.0)
 
             vx = vy = vyaw = 0.0
             if args.input_mode == "controller":
@@ -424,7 +449,9 @@ if __name__ == '__main__':
                 timing.add("state_age_ms", age_ms)
             
             # Send targets to robot via Livekit Portal
+            t_send = time.perf_counter()
             teleop_bridge.send_targets(sol_q, hand_q=controller_hand_q, vx=vx, vy=vy, vyaw=vyaw, fsm_id=fsm)
+            timing.add("send_ms", (time.perf_counter() - t_send) * 1000.0)
 
             if args.record:
                 READY = recorder.is_ready()

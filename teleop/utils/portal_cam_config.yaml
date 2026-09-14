@@ -1,4 +1,12 @@
 # =====================================================
+# Operator display (not a camera slot; robot ignores this file)
+# =====================================================
+# Unmatched on_video_frame is a second RGB path. With a headset it capped
+# LiveKit frames_rx at ~16 Hz. Recording uses matched obs.frames.
+subscribe_unmatched_video: false
+xr_display_fps: 15
+
+# =====================================================
 # Head camera configuration
 # =====================================================
 # camera topic

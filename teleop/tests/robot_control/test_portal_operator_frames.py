@@ -46,6 +46,7 @@ def _video_bridge() -> PortalTeleopBridge:
     bridge._xr_track = TRACK
     bridge._expected_hw = {}
     bridge._frames = {}
+    bridge._decode_cache = {}
     bridge._frames_logged = set()
     bridge._last_obs_had_frames = False
     bridge._obs_ts_us = None
@@ -110,7 +111,20 @@ def test_observation_replaces_older_unmatched_frame():
     assert head.timestamp_us == 200
 
 
-def test_observation_fills_recording_and_display_from_one_decode():
+def test_same_timestamp_is_decoded_once():
+    bridge = _video_bridge()
+    timing = _CountTiming()
+    bridge._match_timing = timing
+    rgb = _solid_rgb(1, 2, 3)
+    frame = _FakeFrame(rgb, 99)
+    bridge._on_video_frame(TRACK, frame)
+    bridge._on_observation(_FakeObs(99, {TRACK: frame}))
+    assert timing.counts.get("decode_miss") == 1
+    assert timing.counts.get("decode_hit") == 1
+    assert len(timing.samples.get("decode_ms", [])) == 1
+    head = bridge.get_head_frame()
+    np.testing.assert_array_equal(head.bgr[0, 0], (3, 2, 1))
+    assert head.timestamp_us == 99
     bridge = _video_bridge()
     bridge._recording_enabled = True
     rgb = _solid_rgb(9, 8, 7)
