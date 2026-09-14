@@ -11,8 +11,8 @@ ping_ms: 1000
 videos:
   # Order = TeleVuer slots (head, left wrist, right wrist). Names match teleimager.
   - { name: head_camera, codec: h264, screencast: false, max_bitrate_kbps: 2000 }
-  - { name: left_wrist_camera, codec: h264, screencast: false, max_bitrate_kbps: 2000 }
-  - { name: right_wrist_camera, codec: h264, screencast: false, max_bitrate_kbps: 2000 }
+  # - { name: left_wrist_camera, codec: h264, screencast: false, max_bitrate_kbps: 2000 }
+  # - { name: right_wrist_camera, codec: h264, screencast: false, max_bitrate_kbps: 2000 }
 state:
   # body ids 0–28, q in rad
   - { name: L_LEG_HIP_PITCH, dtype: f32 }

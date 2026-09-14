@@ -16,7 +16,15 @@ from unittest import mock
 import numpy as np
 import yaml
 
-from teleop.tests.paths import PORTAL_MAPPING, PORTAL_YAML, REPO_ROOT, TELEOP_DIR, TELEOP_ROBOT
+from teleop.tests.paths import (
+    BGR_SOURCE,
+    PORTAL_MAPPING,
+    PORTAL_ROBOT,
+    PORTAL_YAML,
+    REPO_ROOT,
+    TELEOP_DIR,
+    TELEOP_ROBOT,
+)
 from teleop.robot_control import portal_robot as portal_robot_mod
 from teleop.robot_control.encode import (
     EncodeUnavailableError,
@@ -375,15 +383,22 @@ class ComposeContractTests(unittest.TestCase):
 class RgbContractTests(unittest.TestCase):
     def test_video_loop_sends_rgb_not_h264(self):
         with open(TELEOP_ROBOT, "r") as f:
-            src = f.read()
-        self.assertIn("latest_rgb()", src)
-        self.assertIn("portal.send_video_frame(", src)
-        self.assertIn("timestamp_us=ts", src)
-        self.assertIn("EncodeUnavailableError", src)
-        self.assertIn("raise SystemExit(1)", src)
-        self.assertIn("--require-hw-encode", src)
-        self.assertIn("BgrCameraSource", src)
-        self.assertNotIn("ascontiguousarray(head.bgr", src)
+            robot_src = f.read()
+        with open(PORTAL_ROBOT, "r") as f:
+            portal_src = f.read()
+        with open(BGR_SOURCE, "r") as f:
+            ingest_src = f.read()
+        self.assertIn("latest_rgb()", portal_src)
+        self.assertIn("portal.send_video_frame(", portal_src)
+        self.assertIn("timestamp_us=ts", portal_src)
+        self.assertIn("EncodeUnavailableError", robot_src)
+        self.assertIn("raise SystemExit(1)", robot_src)
+        self.assertIn("--require-hw-encode", robot_src)
+        self.assertIn("connect_frame_sources", robot_src)
+        self.assertIn("video_publish_loop", robot_src)
+        self.assertIn("BgrCameraSource", ingest_src)
+        self.assertIn("JpegSlotSource", ingest_src)
+        self.assertNotIn("ascontiguousarray(head.bgr", robot_src + portal_src + ingest_src)
 
         h, w = 8, 12
         bgr = np.zeros((h, w, 3), dtype=np.uint8)
@@ -401,12 +416,10 @@ class RgbContractTests(unittest.TestCase):
         with open(PORTAL_YAML, "r") as f:
             wire = yaml.safe_load(f)
         videos = wire.get("videos") or []
-        names = [v["name"] for v in videos]
         self.assertTrue(videos)
         self.assertEqual(videos[0]["codec"], "h264")
         self.assertEqual(videos[0]["name"], "head_camera")
-        self.assertIn("left_wrist_camera", names)
-        self.assertIn("right_wrist_camera", names)
+        self.assertNotIn("annexb", str(videos[0]).lower())
 
     def test_bgr_zmq_port_offset_and_disabled(self):
         from teleop.utils.bgr_source import bgr_zmq_port

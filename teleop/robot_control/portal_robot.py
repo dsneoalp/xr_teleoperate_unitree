@@ -3,6 +3,9 @@
 Not an arm_ctrl stand-in. The robot control loop owns G1_29_ArmController /
 Dex3 / loco and calls this only to receive actions and publish state.
 
+``video_publish_loop`` stamps RGB from a camera source onto control-loop
+ticks via ``LatestTickSlot`` and ``send_video_frame``.
+
 HW encode DoD runs only when ``require_hw_encode=True`` (CLI
 ``--require-hw-encode``). Default is software / sim, matching control_fix.
 """
@@ -38,7 +41,95 @@ from teleop.robot_control.encode import (
 )
 from teleop.robot_control.portal_mapping import PortalMapping
 from teleop.robot_control.portal_operator import mint_portal_token, _load_dotenv
-from teleop.robot_control.tick_slot import now_us
+from teleop.robot_control.tick_slot import LatestTickSlot, now_us
+from teleop.utils.loop_timing import LoopTiming
+
+VIDEO_WAIT_S = 0.05
+VIDEO_SKIP_LOG_EVERY = 30
+
+
+def video_publish_loop(
+    frame_source,
+    portal,
+    track,
+    stop_evt,
+    tick_slot: LatestTickSlot,
+    timing: LoopTiming | None = None,
+):
+    """Wait for a control-loop tick, grab latest RGB, stamp it once.
+
+    Pacing comes from the control loop via the slot, not a second 1/fps sleep.
+    Duplicate source seq is skipped; the consumed timestamp is not reused.
+    """
+    logged = False
+    skip_count = 0
+    last_seq = -1
+    timing = timing or LoopTiming(logger_mp, prefix="[timing-video]")
+    last_encode_t = None
+    while not stop_evt.is_set():
+        ts = tick_slot.wait_take(timeout=VIDEO_WAIT_S)
+        if ts is None:
+            continue
+        try:
+            grab_t0 = time.perf_counter()
+            item = frame_source.latest_rgb()
+            grab_ms = (time.perf_counter() - grab_t0) * 1000.0
+            if item is None:
+                skip_count += 1
+                if skip_count == 1 or skip_count % VIDEO_SKIP_LOG_EVERY == 0:
+                    logger_mp.debug(
+                        f"video skip: no camera frame for tick {ts} "
+                        f"track={track} (skips={skip_count})"
+                    )
+                continue
+            rgb_buf, seq = item
+            if seq == last_seq:
+                timing.count(f"{track}_dup")
+                continue
+            if last_seq >= 0:
+                skipped = seq - last_seq - 1
+                if skipped > 0:
+                    timing.count(f"{track}_src_skipped", skipped)
+            last_seq = seq
+            timing.count(f"{track}_new")
+            encode_t0 = time.perf_counter()
+            if last_encode_t is not None:
+                timing.add("video_gap_ms", (encode_t0 - last_encode_t) * 1000.0)
+            last_encode_t = encode_t0
+            portal.send_video_frame(track, rgb_buf, timestamp_us=ts)
+            timing.add("grab_ms", grab_ms)
+            timing.add("encode_ms", (time.perf_counter() - encode_t0) * 1000.0)
+            skip_count = 0
+            if not logged:
+                h, w = rgb_buf.shape[:2]
+                logger_mp.info(f"publishing '{track}' {w}x{h} (video thread)")
+                logged = True
+        except EncodeUnavailableError as exc:
+            logger_mp.error(f"video thread HW encode DoD failed: {exc}")
+            stop_evt.set()
+            return
+        except Exception as exc:
+            logger_mp.warning(f"video thread: {exc}")
+
+
+def video_publish_loop_maybe_profile(
+    frame_source, portal, track, stop_evt, tick_slot, timing
+):
+    """Optional cProfile around the video thread when SAG_PROFILE_VIDEO=1."""
+    if os.environ.get("SAG_PROFILE_VIDEO", "0") != "1":
+        video_publish_loop(frame_source, portal, track, stop_evt, tick_slot, timing)
+        return
+    import cProfile
+
+    profiler = cProfile.Profile()
+    profiler.enable()
+    try:
+        video_publish_loop(frame_source, portal, track, stop_evt, tick_slot, timing)
+    finally:
+        profiler.disable()
+        dump_path = os.environ.get("SAG_PROFILE_VIDEO_PATH", "/tmp/teleop_video.cprof")
+        profiler.dump_stats(dump_path)
+        logger_mp.info(f"video thread cProfile dumped to {dump_path}")
 
 
 class PortalRobotTransport:

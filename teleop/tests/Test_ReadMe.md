@@ -7,7 +7,9 @@ From the **repo root**. `pytest.ini` collects `teleop/tests`.
 | Area | Location | What it checks |
 | --- | --- | --- |
 | Portal send / sync | `teleop/tests/robot_control/test_tick_slot.py`, `test_obs_record_buffer.py`, `test_portal_operator_send.py`, `test_portal_operator_frames.py` | Same `tick_ts` on state+frame; operator `in_reply_to_ts_us`; recording pairs |
-| Video pacing | `teleop/tests/test_video_publish_timing.py` | `encode_ms` / `video_gap_ms` around `send_video_frame` |
+| Video pacing | `teleop/tests/robot_control/test_video_publish_timing.py` | `encode_ms` / `video_gap_ms` around `send_video_frame` |
+| Command smoothing | `teleop/tests/utils/test_cmd_filter.py` | `interp_cmd` / `filter_cmd` |
+| Camera ingest | `teleop/tests/utils/test_bgr_source.py` | BGR preferred, JPEG fallback, payload/crop |
 | Arm stiffness | `teleop/tests/utils/test_arm_stiffness.py` | fade curve 1→0 |
 | HW encode (offline) | `teleop/tests/robot_control/test_portal_hw_encode.py` | probe, OpenH264 fail-closed, `--require-hw-encode` skip, compose PC vs G1 |
 | Mock CLI | `teleop/tests/test_mock_cli.py` | mock argparse |

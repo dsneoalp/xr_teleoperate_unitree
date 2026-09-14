@@ -6,7 +6,7 @@ import time
 import numpy as np
 
 from teleop.robot_control.tick_slot import LatestTickSlot
-from teleop.teleop_robot import _video_publish_loop
+from teleop.robot_control.portal_robot import video_publish_loop
 
 
 class _RecordingTiming:
@@ -50,7 +50,7 @@ def test_video_loop_records_encode_ms():
     portal = _FakePortal(encode_s)
     timing = _RecordingTiming()
     thread = threading.Thread(
-        target=_video_publish_loop,
+        target=video_publish_loop,
         args=(_FakeSource(), portal, "head", stop_evt, slot, timing),
         daemon=True,
     )

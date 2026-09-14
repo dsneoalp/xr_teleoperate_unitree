@@ -1,18 +1,23 @@
-"""Raw BGR ZMQ ingest for Portal RGB publish (one SUB per camera slot).
+"""Teleimager camera ingest for Portal RGB publish.
 
-Subscribes to teleimager's BGR publisher (zmq_port + 1000) so the robot
-process does not JPEG-decode the same stream video-ingress already
-consumes as raw BGR. Color convert stays packed RGB24 for livekit-portal
-FFI; no downscale.
+BGR ZMQ (zmq_port + 1000) is preferred so the robot process does not
+JPEG-decode a stream the server already publishes as packed BGR.
+JPEG ZMQ is the fallback when ``enable_bgr_zmq`` is off. Color convert
+stays packed RGB24 for livekit-portal FFI; no downscale.
+
+No LiveKit / Portal FFI here — only teleimager config + frame sources.
 """
 from __future__ import annotations
 
 import json
+import os
 import struct
 import threading
-from typing import Any, Dict, Optional, Tuple
+import time
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 import numpy as np
+import yaml
 
 import logging_mp
 
@@ -20,6 +25,10 @@ logger_mp = logging_mp.getLogger(__name__)
 
 BGR_ZMQ_PORT_OFFSET = 1000
 _RGB_RING = 3
+IMAGE_CLIENT_RETRIES = 50
+IMAGE_CLIENT_RETRY_S = 0.1
+
+_TELEOP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def fetch_teleimager_config(
@@ -179,6 +188,150 @@ class BgrCameraSource:
                     self._seq += 1
         finally:
             sock.close(linger=0)
+
+
+class JpegSlotSource:
+    """JPEG fallback for one teleimager slot when raw BGR is unavailable."""
+
+    def __init__(
+        self,
+        host: str,
+        cam_config,
+        slot: str,
+        request_bgr: bool = True,
+        subscriber_manager=None,
+    ):
+        self._host = host
+        self._slot = slot
+        self._request_bgr = request_bgr
+        self._cam_config = cam_config
+        self._rgb_buf = None
+        self._seq = 0
+        if subscriber_manager is None:
+            from teleimager.image_client import ZMQ_SubscriberManager
+
+            subscriber_manager = ZMQ_SubscriberManager.get_instance()
+        self._subscriber_manager = subscriber_manager
+        cam = self._cam_config.get(slot) or {}
+        if not cam.get("enable_zmq"):
+            logger_mp.warning(
+                f"[Image Client] {slot} ZMQ is not enabled; track will not publish"
+            )
+            return
+        port = cam["zmq_port"]
+        self._subscriber_manager.subscribe(host, port, request_bgr=request_bgr)
+        logger_mp.info(f"JPEG ZMQ '{slot}' {host}:{port} (BGR unavailable)")
+
+    def latest_rgb(self):
+        cam = self._cam_config[self._slot]
+        frame = self._subscriber_manager.subscribe(
+            self._host, cam["zmq_port"], request_bgr=self._request_bgr
+        )
+        if frame is None or getattr(frame, "bgr", None) is None:
+            return None
+        rgb = bgr_to_rgb(even_crop(frame.bgr), self._rgb_buf)
+        self._rgb_buf = rgb
+        self._seq += 1
+        return rgb, self._seq
+
+    def close(self):
+        logger_mp.info(f"JPEG source '{self._slot}' closed.")
+
+
+def local_cam_config_paths():
+    """Bind-mounted teleop YAMLs. site-packages ZMQ_Requester looks two dirs
+    above image_client.py and misses these when GET_DATA on :60000 times out."""
+    return (
+        os.path.join(_TELEOP_DIR, "teleimager", "cam_config_client.yaml"),
+        os.path.join(_TELEOP_DIR, "teleimager", "cam_config_server.yaml"),
+        os.path.join(_TELEOP_DIR, "utils", "portal_cam_config.yaml"),
+    )
+
+
+def load_local_cam_config():
+    for path in local_cam_config_paths():
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f)
+        except Exception as exc:
+            logger_mp.warning(f"Failed to load local {path}: {exc}")
+            continue
+        if cfg:
+            logger_mp.info(f"Loaded camera config from local {path}")
+            return cfg
+    return None
+
+
+def _log_cam_config(cfg):
+    """Log teleimager slots (shape is [H, W])."""
+    logger_mp.info(
+        f"teleimager cam_config:\n{yaml.safe_dump(cfg, sort_keys=False).rstrip()}"
+    )
+
+
+def connect_frame_sources(
+    host: str,
+    tracks: Iterable[str],
+    retries: int = IMAGE_CLIENT_RETRIES,
+    retry_s: float = IMAGE_CLIENT_RETRY_S,
+):
+    """One ingest per portal.yaml video track. BGR ZMQ preferred, JPEG fallback."""
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            cfg = fetch_teleimager_config(host)
+            if cfg is not None:
+                logger_mp.info(f"Received camera config from server {host}:60000")
+                _log_cam_config(cfg)
+            else:
+                cfg = load_local_cam_config()
+                if cfg is not None:
+                    _log_cam_config(cfg)
+            if cfg is None:
+                raise RuntimeError("Failed to get camera configuration.")
+            sources = {}
+            try:
+                for track in tracks:
+                    port = bgr_zmq_port(cfg, track)
+                    if port is not None:
+                        source = BgrCameraSource(host, port, slot=track)
+                        source.start()
+                        sources[track] = source
+                        logger_mp.info(
+                            f"track '{track}' BGR {host}:{port} (attempt {attempt})"
+                        )
+                        continue
+                    slot = cfg.get(track) if isinstance(cfg.get(track), dict) else None
+                    if slot and slot.get("enable_zmq"):
+                        sources[track] = JpegSlotSource(
+                            host=host, cam_config=cfg, slot=track, request_bgr=True
+                        )
+                        logger_mp.info(
+                            f"track '{track}' JPEG fallback (attempt {attempt})"
+                        )
+                        continue
+                    logger_mp.warning(
+                        f"portal track '{track}' has no teleimager BGR/JPEG source; skip"
+                    )
+                if sources:
+                    return sources
+                raise RuntimeError("No video sources matched portal.yaml tracks.")
+            except Exception:
+                for source in sources.values():
+                    try:
+                        source.close()
+                    except Exception:
+                        pass
+                raise
+        except Exception as exc:
+            last_error = exc
+            time.sleep(retry_s)
+    logger_mp.warning(
+        f"ImageClient failed after {retries} tries: {last_error}"
+    )
+    return {}
 
 
 HeadBgrSource = BgrCameraSource
