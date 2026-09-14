@@ -50,6 +50,9 @@ from teleop.utils.loop_timing import LoopTiming
 
 # ImageClient / TeleVuer slot names. Portal tracks bind by yaml order.
 _TELEVUER_SLOTS = ("head_camera", "left_wrist_camera", "right_wrist_camera")
+STAMP_LOG_FIRST = 5
+UNMATCHED_IDLE_AFTER_FRAMED_OBS = 30
+PORTAL_METRICS_LOG_S = 1.0
 
 
 class _Frame:
@@ -211,6 +214,16 @@ class PortalTeleopBridge:
             self._op.on_video_frame(track, self._on_video_frame)
         self._frames_logged = set()
         self._match_timing = LoopTiming(logger_mp, prefix="[timing-match]")
+        self._stamp_log_n = 0
+        self._framed_obs_n = 0
+        self._unmatched_idle_logged = False
+        self._unmatched_seen = False
+        self._unmatched_logged = False
+        self._last_metrics_log = 0.0
+        logger_mp.info(
+            f"[portal] on_video_frame subscribed for {self._declared_videos}; "
+            "idle is normal if unified sampling delivers frames only in "
+            "obs.frames")
 
         arm_dof = self._map.arm_dof
         hand_dof = self._map.hand_dof
@@ -304,6 +317,79 @@ class PortalTeleopBridge:
         if timing is not None and n:
             timing.count(name, n)
 
+    def _add_match(self, name: str, value_ms: float) -> None:
+        timing = getattr(self, "_match_timing", None)
+        if timing is not None:
+            timing.add(name, value_ms)
+
+    @staticmethod
+    def _frame_ts_us(frame) -> int:
+        return int(getattr(frame, "timestamp_us", 0) or 0)
+
+    def _note_obs_stamps(self, obs_ts_us, raw_frames: dict) -> None:
+        """Compare observation (state) timestamp to each attached frame stamp."""
+        if not raw_frames or obs_ts_us is None:
+            return
+        obs_ts = int(obs_ts_us)
+        self._framed_obs_n = getattr(self, "_framed_obs_n", 0) + 1
+        for track, frame in raw_frames.items():
+            frame_ts = self._frame_ts_us(frame)
+            delta_ms = (frame_ts - obs_ts) / 1000.0
+            self._add_match("match_delta_ms", delta_ms)
+            if frame_ts == 0:
+                self._count_match("frame_ts_zero")
+            elif frame_ts == obs_ts:
+                self._count_match("ts_eq")
+            else:
+                self._count_match("ts_ne")
+                self._add_match("match_abs_delta_ms", abs(delta_ms))
+            logged = getattr(self, "_stamp_log_n", 0)
+            if logged < STAMP_LOG_FIRST:
+                self._stamp_log_n = logged + 1
+                logger_mp.info(
+                    f"[portal] stamp obs_ts={obs_ts} frame_ts={frame_ts} "
+                    f"delta_ms={delta_ms:.1f} track={track!r}")
+        if (not getattr(self, "_unmatched_idle_logged", False)
+                and not getattr(self, "_unmatched_seen", False)
+                and self._framed_obs_n >= UNMATCHED_IDLE_AFTER_FRAMED_OBS):
+            self._unmatched_idle_logged = True
+            logger_mp.info(
+                f"[portal] on_video_frame idle after {self._framed_obs_n} "
+                "framed obs — frames are arriving in obs.frames only "
+                "(unified sampling), not the unmatched path")
+
+    def _maybe_log_portal_metrics(self) -> None:
+        op = getattr(self, "_op", None)
+        if op is None or not hasattr(op, "metrics"):
+            return
+        now = time.monotonic()
+        last = getattr(self, "_last_metrics_log", 0.0)
+        if now - last < PORTAL_METRICS_LOG_S:
+            return
+        self._last_metrics_log = now
+        try:
+            metrics = op.metrics()
+        except Exception as exc:
+            logger_mp.debug(f"[portal] metrics() failed: {exc}")
+            return
+        sync = getattr(metrics, "sync", None)
+        transport = getattr(metrics, "transport", None)
+        parts = []
+        if sync is not None:
+            parts.append(
+                f"obs_emitted={getattr(sync, 'observations_emitted', '?')} "
+                f"stale={getattr(sync, 'stale_observations_emitted', '?')} "
+                f"states_dropped={getattr(sync, 'states_dropped', '?')} "
+                f"match_delta_us p50={getattr(sync, 'match_delta_us_p50', None)} "
+                f"p95={getattr(sync, 'match_delta_us_p95', None)} "
+                f"blocker={getattr(sync, 'last_blocker_track', None)!r}")
+        if transport is not None:
+            parts.append(
+                f"frames_rx={getattr(transport, 'frames_received', None)} "
+                f"states_rx={getattr(transport, 'states_received', None)}")
+        if parts:
+            logger_mp.info("[portal-metrics] " + " | ".join(parts))
+
     @staticmethod
     def _drop_n(drops) -> int:
         if drops is None:
@@ -320,6 +406,7 @@ class PortalTeleopBridge:
         self._count_match("drop", n)
         if n:
             logger_mp.info(f"[portal] dropped states: {n}")
+        self._maybe_log_portal_metrics()
 
     def _on_observation(self, obs) -> None:
         ts_us = getattr(obs, "timestamp_us", None)
@@ -334,6 +421,8 @@ class PortalTeleopBridge:
         self._count_match("obs")
         if had_frames:
             self._count_match("obs_framed")
+            self._note_obs_stamps(ts_us, raw_frames)
+        self._maybe_log_portal_metrics()
 
         rtt_ms = None
         with self._obs_lock:
@@ -381,8 +470,14 @@ class PortalTeleopBridge:
             self._obs_ts_us = ts_us
 
     def _on_video_frame(self, track: str, frame) -> None:
-        if track == getattr(self, "_xr_track", None):
-            self._count_match("unmatched_video")
+        self._unmatched_seen = True
+        self._count_match("unmatched_video")
+        frame_ts = self._frame_ts_us(frame)
+        if not getattr(self, "_unmatched_logged", False):
+            self._unmatched_logged = True
+            logger_mp.info(
+                f"[portal] on_video_frame '{track}' ts={frame_ts} "
+                "(unmatched path is live)")
         self._merge_display_frames(self._decode_video_frame(track, frame))
 
     def _merge_display_frames(self, stored: dict) -> None:

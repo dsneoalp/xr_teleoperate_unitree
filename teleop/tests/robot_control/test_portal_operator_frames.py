@@ -62,6 +62,12 @@ def _video_bridge() -> PortalTeleopBridge:
     bridge._dual_hand_state_array_out = None
     bridge._dual_hand_data_lock = None
     bridge._match_timing = None
+    bridge._stamp_log_n = 0
+    bridge._framed_obs_n = 0
+    bridge._unmatched_idle_logged = False
+    bridge._unmatched_seen = False
+    bridge._unmatched_logged = False
+    bridge._last_metrics_log = 0.0
     return bridge
 
 
@@ -128,9 +134,13 @@ def test_recording_skips_observation_without_frames():
 class _CountTiming:
     def __init__(self):
         self.counts: dict[str, int] = {}
+        self.samples: dict[str, list[float]] = {}
 
     def count(self, name: str, n: int = 1) -> None:
         self.counts[name] = self.counts.get(name, 0) + n
+
+    def add(self, name: str, value_ms: float) -> None:
+        self.samples.setdefault(name, []).append(float(value_ms))
 
 
 def test_match_timing_counts_obs_drops_and_unmatched_video():
@@ -146,6 +156,32 @@ def test_match_timing_counts_obs_drops_and_unmatched_video():
     assert timing.counts["obs"] == 2
     assert timing.counts["obs_framed"] == 1
     assert timing.counts["drop"] == 2
+    assert timing.counts["ts_eq"] == 1
+    assert timing.samples["match_delta_ms"] == [0.0]
+
+
+def test_stamp_mismatch_and_zero_are_counted():
+    bridge = _video_bridge()
+    timing = _CountTiming()
+    bridge._match_timing = timing
+    rgb = _solid_rgb(1, 2, 3)
+    bridge._on_observation(_FakeObs(1000, {TRACK: _FakeFrame(rgb, 0)}))
+    bridge._on_observation(_FakeObs(2000, {TRACK: _FakeFrame(rgb, 2500)}))
+    assert timing.counts["frame_ts_zero"] == 1
+    assert timing.counts["ts_ne"] == 1
+    assert timing.samples["match_abs_delta_ms"] == [0.5]
+
+
+def test_unmatched_idle_after_framed_obs(monkeypatch):
+    from teleop.robot_control import portal_operator as po
+    monkeypatch.setattr(po, "UNMATCHED_IDLE_AFTER_FRAMED_OBS", 2)
+    monkeypatch.setattr(po, "STAMP_LOG_FIRST", 0)
+    bridge = _video_bridge()
+    rgb = _solid_rgb(1, 2, 3)
+    bridge._on_observation(_FakeObs(1, {TRACK: _FakeFrame(rgb, 1)}))
+    assert bridge._unmatched_idle_logged is False
+    bridge._on_observation(_FakeObs(2, {TRACK: _FakeFrame(rgb, 2)}))
+    assert bridge._unmatched_idle_logged is True
 
 
 def test_drop_n_accepts_list_and_int():

@@ -106,7 +106,7 @@ def get_state() -> dict:
 if __name__ == '__main__':
     # Parse arguments
     parser = argparse.ArgumentParser()
-    parser.add_argument('--frequency', type=float, default=30.0)
+    parser.add_argument('--frequency', type=float, default=60.0)
     parser.add_argument('--input-mode', type=str, choices=['hand', 'controller'], default='hand')
     parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive')
     parser.add_argument('--arm', type=str, choices=['G1_29'], default='G1_29')
