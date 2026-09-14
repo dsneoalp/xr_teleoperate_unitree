@@ -9,10 +9,8 @@ action_reliable: false
 reuse_stale_frames: false
 ping_ms: 1000
 videos:
-  # Order = TeleVuer slots (head, left wrist, right wrist). Names match teleimager.
+  # Single 720p 2x2 mosaic (ingress grid, 720p blit). TeleVuer slot 0 shows the canvas.
   - { name: head_camera, codec: h264, screencast: false, max_bitrate_kbps: 2000 }
-  - { name: left_wrist_camera, codec: h264, screencast: false, max_bitrate_kbps: 2000 }
-  - { name: right_wrist_camera, codec: h264, screencast: false, max_bitrate_kbps: 2000 }
 
 
 state:

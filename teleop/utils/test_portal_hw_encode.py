@@ -361,12 +361,13 @@ class RgbContractTests(unittest.TestCase):
         self.assertIn("BgrCameraSource", src)
         self.assertIn("bgr_zmq_port", src)
         self.assertIn("_connect_frame_sources", src)
-        self.assertIn("portal.video_tracks", src)
+        self.assertIn("MosaicCompositor", src)
+        self.assertIn("compositor.canvas", src)
+        self.assertIn("mosaic.yaml", src)
         self.assertNotIn("ascontiguousarray(head.bgr", src)
         self.assertNotIn("cv2.resize", src)
         self.assertIn("portal.send_video_frame(", src)
-        self.assertIn("track, rgb_buf", src)
-        self.assertIn("_send_ms", src)
+        self.assertIn("send_ms", src)
         self.assertIn("loop_ms", src)
         self.assertIn("_log_cam_config", src)
         self.assertIn("EncodeUnavailableError", src)
@@ -389,12 +390,10 @@ class RgbContractTests(unittest.TestCase):
             wire = yaml.safe_load(f)
         videos = wire.get("videos") or []
         self.assertTrue(videos)
-        names = [v["name"] for v in videos]
-        self.assertEqual(names[0], "head_camera")
-        self.assertIn("left_wrist_camera", names)
-        self.assertIn("right_wrist_camera", names)
-        for video in videos:
-            self.assertEqual(video["codec"], "h264")
+        self.assertEqual(len(videos), 1)
+        self.assertEqual(videos[0]["name"], "head_camera")
+        self.assertEqual(videos[0]["codec"], "h264")
+        self.assertGreaterEqual(int(videos[0]["max_bitrate_kbps"]), 4000)
 
 
 class BgrSourceTests(unittest.TestCase):
@@ -450,6 +449,50 @@ class BgrSourceTests(unittest.TestCase):
         self.assertNotIn("cv2.resize", src)
         self.assertNotIn("max_width", src)
         self.assertNotIn("INTER_AREA", src)
+
+
+class MosaicTests(unittest.TestCase):
+    def test_layout_720p_2x2_even(self):
+        from teleop.utils.mosaic import load_mosaic_layout
+
+        layout_path = os.path.join(_teleop_dir, "mosaic.yaml")
+        layout = load_mosaic_layout(layout_path)
+        self.assertEqual((layout.width, layout.height), (1280, 720))
+        self.assertEqual(layout.slots, ("head_camera", "left_wrist_camera", "right_wrist_camera"))
+        head, left, right = layout.tiles
+        self.assertEqual((head.x, head.y, head.w, head.h), (0, 0, 640, 360))
+        self.assertEqual(head.fit, "fill")
+        self.assertEqual((left.x, left.y, left.w, left.h), (640, 0, 640, 360))
+        self.assertEqual(left.fit, "fill")
+        self.assertEqual((right.x, right.y, right.w, right.h), (0, 360, 640, 360))
+        self.assertEqual(right.fit, "fill")
+
+    def test_compose_places_tiles(self):
+        from teleop.utils.mosaic import MosaicCompositor, load_mosaic_layout
+
+        layout = load_mosaic_layout(os.path.join(_teleop_dir, "mosaic.yaml"))
+        comp = MosaicCompositor(layout)
+        head = np.zeros((720, 1280, 3), dtype=np.uint8)
+        head[:] = (10, 20, 30)
+        left = np.zeros((720, 1280, 3), dtype=np.uint8)
+        left[:] = (40, 50, 60)
+        right = np.zeros((720, 1280, 3), dtype=np.uint8)
+        right[:] = (70, 80, 90)
+        comp.paste("head_camera", head)
+        comp.paste("left_wrist_camera", left)
+        comp.paste("right_wrist_camera", right)
+        canvas = comp.canvas
+        self.assertEqual(canvas.shape, (720, 1280, 3))
+        np.testing.assert_array_equal(canvas[0, 0], [10, 20, 30])
+        np.testing.assert_array_equal(canvas[180, 320], [10, 20, 30])
+        np.testing.assert_array_equal(canvas[180, 960], [40, 50, 60])
+        np.testing.assert_array_equal(canvas[540, 320], [70, 80, 90])
+        np.testing.assert_array_equal(canvas[540, 960], [0, 0, 0])
+        head[:] = (11, 22, 33)
+        comp.paste("head_camera", head)
+        np.testing.assert_array_equal(comp.canvas[0, 0], [11, 22, 33])
+        np.testing.assert_array_equal(comp.canvas[180, 960], [40, 50, 60])
+        np.testing.assert_array_equal(comp.canvas[540, 320], [70, 80, 90])
 
 
 class LoopTimingTests(unittest.TestCase):

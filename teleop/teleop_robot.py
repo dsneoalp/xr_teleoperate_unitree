@@ -34,6 +34,7 @@ from teleop.utils.bgr_source import (
     fetch_teleimager_config,
 )
 from teleop.utils.loop_timing import LoopTiming
+from teleop.utils.mosaic import MosaicCompositor, load_mosaic_layout
 
 FSM_IDLE = 0
 FSM_TELEOP = 1
@@ -42,6 +43,7 @@ FSM_HAND_SETUP = 3
 ACTION_TIMEOUT = 0.2
 IMAGE_CLIENT_RETRIES = 50
 IMAGE_CLIENT_RETRY_S = 0.1
+MOSAIC_YAML = os.path.join(current_dir, "mosaic.yaml")
 
 
 def interp_cmd(state, q_cmd, now, tau):
@@ -152,8 +154,8 @@ class _JpegSlotSource:
         logger_mp.info(f"JPEG source '{self._slot}' closed.")
 
 
-def _connect_frame_sources(host: str, tracks):
-    """One ingest per portal.yaml video track. BGR ZMQ preferred, JPEG fallback."""
+def _connect_frame_sources(host: str, slots):
+    """One ingest per mosaic slot. BGR ZMQ preferred, JPEG fallback."""
     last_error = None
     for attempt in range(1, IMAGE_CLIENT_RETRIES + 1):
         try:
@@ -169,31 +171,31 @@ def _connect_frame_sources(host: str, tracks):
                 raise RuntimeError("Failed to get camera configuration.")
             sources = {}
             try:
-                for track in tracks:
-                    port = bgr_zmq_port(cfg, track)
+                for slot in slots:
+                    port = bgr_zmq_port(cfg, slot)
                     if port is not None:
-                        source = BgrCameraSource(host, port, slot=track)
+                        source = BgrCameraSource(host, port, slot=slot)
                         source.start()
-                        sources[track] = source
+                        sources[slot] = source
                         logger_mp.info(
-                            f"track '{track}' BGR {host}:{port} (attempt {attempt})"
+                            f"slot '{slot}' BGR {host}:{port} (attempt {attempt})"
                         )
                         continue
-                    slot = cfg.get(track) if isinstance(cfg.get(track), dict) else None
-                    if slot and slot.get("enable_zmq"):
-                        sources[track] = _JpegSlotSource(
-                            host=host, cam_config=cfg, slot=track, request_bgr=True
+                    cam = cfg.get(slot) if isinstance(cfg.get(slot), dict) else None
+                    if cam and cam.get("enable_zmq"):
+                        sources[slot] = _JpegSlotSource(
+                            host=host, cam_config=cfg, slot=slot, request_bgr=True
                         )
                         logger_mp.info(
-                            f"track '{track}' JPEG fallback (attempt {attempt})"
+                            f"slot '{slot}' JPEG fallback (attempt {attempt})"
                         )
                         continue
                     logger_mp.warning(
-                        f"portal track '{track}' has no teleimager BGR/JPEG source; skip"
+                        f"mosaic slot '{slot}' has no teleimager BGR/JPEG source; skip"
                     )
                 if sources:
                     return sources
-                raise RuntimeError("No video sources matched portal.yaml tracks.")
+                raise RuntimeError("No video sources matched mosaic.yaml slots.")
             except Exception:
                 for source in sources.values():
                     try:
@@ -210,43 +212,47 @@ def _connect_frame_sources(host: str, tracks):
     return {}
 
 
-def _video_publish_loop(frame_source, portal, track, stop_evt, fps: float, timing):
-    """Publish latest RGB off the control loop. Skip duplicate seq; pin first even WxH."""
+def _video_publish_loop(sources, compositor, portal, track, stop_evt, fps: float, timing):
+    """Compose dirty tiles onto the mosaic canvas and send one RGB frame."""
     logged = False
-    last_seq = -1
-    locked_wh = None
+    last_seq = {slot: -1 for slot in compositor.layout.slots}
     interval = 1.0 / max(fps, 1.0)
     while not stop_evt.is_set():
         t0 = time.perf_counter()
         try:
-            item = frame_source.latest_rgb()
-            if item is not None:
+            any_new = False
+            mosaic_t0 = time.perf_counter()
+            for slot, source in sources.items():
+                item = source.latest_rgb()
+                if item is None:
+                    continue
                 rgb_buf, seq = item
-                if seq != last_seq:
-                    timing.count(f"{track}_new")
-                    h, w = rgb_buf.shape[:2]
-                    if locked_wh is None:
-                        locked_wh = (w, h)
-                    if (w, h) == locked_wh:
-                        if last_seq >= 0:
-                            skipped = seq - last_seq - 1
-                            if skipped > 0:
-                                timing.count(f"{track}_src_skipped", skipped)
-                        last_seq = seq
-                        send_t0 = time.perf_counter()
-                        portal.send_video_frame(
-                            track, rgb_buf, timestamp_us=int(time.time() * 1_000_000)
-                        )
-                        timing.add(
-                            f"{track}_send_ms", (time.perf_counter() - send_t0) * 1000.0
-                        )
-                        if not logged:
-                            logger_mp.info(
-                                f"publishing '{track}' {w}x{h} (video thread)"
-                            )
-                            logged = True
-                else:
-                    timing.count(f"{track}_dup")
+                prev = last_seq.get(slot, -1)
+                if seq == prev:
+                    continue
+                if prev >= 0:
+                    skipped = seq - prev - 1
+                    if skipped > 0:
+                        timing.count(f"{slot}_src_skipped", skipped)
+                last_seq[slot] = seq
+                compositor.paste(slot, rgb_buf)
+                any_new = True
+                timing.count(f"{slot}_new")
+            timing.add("mosaic_ms", (time.perf_counter() - mosaic_t0) * 1000.0)
+            if any_new:
+                send_t0 = time.perf_counter()
+                portal.send_video_frame(
+                    track, compositor.canvas, timestamp_us=int(time.time() * 1_000_000)
+                )
+                timing.add("send_ms", (time.perf_counter() - send_t0) * 1000.0)
+                if not logged:
+                    h, w = compositor.canvas.shape[:2]
+                    logger_mp.info(
+                        f"publishing '{track}' {w}x{h} mosaic (video thread)"
+                    )
+                    logged = True
+            else:
+                timing.count("mosaic_dup")
         except EncodeUnavailableError as exc:
             logger_mp.error(f"video thread HW encode DoD failed: {exc}")
             stop_evt.set()
@@ -258,17 +264,23 @@ def _video_publish_loop(frame_source, portal, track, stop_evt, fps: float, timin
             stop_evt.wait(sleep)
 
 
-def _video_publish_loop_maybe_profile(frame_source, portal, track, stop_evt, fps: float, timing):
+def _video_publish_loop_maybe_profile(
+    sources, compositor, portal, track, stop_evt, fps: float, timing
+):
     """Optional cProfile around the video thread when SAG_PROFILE_VIDEO=1."""
     if os.environ.get("SAG_PROFILE_VIDEO", "0") != "1":
-        _video_publish_loop(frame_source, portal, track, stop_evt, fps, timing)
+        _video_publish_loop(
+            sources, compositor, portal, track, stop_evt, fps, timing
+        )
         return
     import cProfile
 
     profiler = cProfile.Profile()
     profiler.enable()
     try:
-        _video_publish_loop(frame_source, portal, track, stop_evt, fps, timing)
+        _video_publish_loop(
+            sources, compositor, portal, track, stop_evt, fps, timing
+        )
     finally:
         profiler.disable()
         dump_path = os.environ.get("SAG_PROFILE_VIDEO_PATH", "/tmp/teleop_video.cprof")
@@ -335,25 +347,28 @@ if __name__ == '__main__':
     applied_fsm = FSM_IDLE
     timing = LoopTiming(logger_mp)
 
+    mosaic_layout = load_mosaic_layout(MOSAIC_YAML)
+    compositor = MosaicCompositor(mosaic_layout)
     img_sources = {} if args.no_img else _connect_frame_sources(
-        args.img_server_ip, portal.video_tracks
+        args.img_server_ip, mosaic_layout.slots
     )
     video_stop = threading.Event()
     video_threads = []
-    for i, (track, source) in enumerate(img_sources.items()):
-        target = (
-            _video_publish_loop_maybe_profile if i == 0 else _video_publish_loop
-        )
+    track = portal.video_tracks[0] if portal.video_tracks else None
+    if img_sources and track:
         thread = threading.Thread(
-            target=target,
-            args=(source, portal, track, video_stop, args.frequency, timing),
-            name=f"video-{track}",
+            target=_video_publish_loop_maybe_profile,
+            args=(
+                img_sources, compositor, portal, track, video_stop,
+                args.frequency, timing,
+            ),
+            name="video-mosaic",
             daemon=True)
         thread.start()
         video_threads.append(thread)
-    if video_threads:
         logger_mp.info(
-            f"video publish threads started: {list(img_sources)}"
+            f"mosaic {mosaic_layout.width}x{mosaic_layout.height} "
+            f"slots={list(img_sources)} track='{track}'"
         )
     last_action_wall = {'t': 0.0}
     arm_cmd = {}
