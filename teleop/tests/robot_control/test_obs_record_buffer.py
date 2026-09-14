@@ -6,6 +6,7 @@ from teleop.robot_control.obs_record_buffer import (
     RecordingObservation,
     RecordingObsBuffer,
     RecordingPair,
+    record_buffer_maxlen,
 )
 from teleop.utils.episode_item import colors_from_head, states_actions_from_pair
 
@@ -59,7 +60,9 @@ def test_clear_drops_pending():
 
 
 def test_default_maxlen():
-    assert OBS_RECORD_BUFFER_MAXLEN == 2
+    assert OBS_RECORD_BUFFER_MAXLEN == 10
+    assert record_buffer_maxlen(5) == 10
+    assert record_buffer_maxlen(8) == 16
 
 
 def test_colors_from_head_mono_and_binocular():

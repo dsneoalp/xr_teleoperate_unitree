@@ -69,6 +69,7 @@ services:
       - portal_local.yaml
       - --env-file
       - .env.local
+      - --record
 
   robot:
     <<: *local-env

@@ -12,7 +12,13 @@ from threading import Lock
 
 import numpy as np
 
-OBS_RECORD_BUFFER_MAXLEN = 2
+# Default matches portal.yaml slack=5: 2×slack, floor 10.
+OBS_RECORD_BUFFER_MAXLEN = 10
+
+
+def record_buffer_maxlen(slack: int) -> int:
+    """Recording buffer depth from Portal slack (ticks). At least 10."""
+    return max(10, int(slack) * 2)
 
 
 @dataclass

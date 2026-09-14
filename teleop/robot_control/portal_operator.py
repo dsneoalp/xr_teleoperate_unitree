@@ -11,7 +11,8 @@ Used by teleop_operator.py (not as arm_ctrl):
     TeleVuer / get_head_frame() is filled from unmatched on_video_frame
     (lowest display latency) and from matched obs.frames, so XR still
     updates when tick-synced frames never take the unmatched path.
-    Recording uses obs.frames paired with send_action via in_reply_to_ts_us.
+    Recording uses framed obs paired with send_action via in_reply_to_ts_us
+    (in_reply_to is published only after the observation is buffered).
 
 No unitree_sdk2py import happens anywhere in this module.
 Joint names come from portal_mapping.yaml, not hardcoded tuples.
@@ -42,6 +43,7 @@ from teleop.robot_control.obs_record_buffer import (
     RecordingObservation,
     RecordingPair,
     RecordingObsBuffer,
+    record_buffer_maxlen,
 )
 from teleop.robot_control.tick_slot import now_us
 
@@ -222,7 +224,8 @@ class PortalTeleopBridge:
         self._pending_action_wall = None
         self._rtt_cb = None
         self._recording_enabled = False
-        self._rec_buf = RecordingObsBuffer()
+        slack = int(self._wire.get("slack") or 5)
+        self._rec_buf = RecordingObsBuffer(maxlen=record_buffer_maxlen(slack))
         self._record_pair_cb = None
         self._last_obs_had_frames = False
 
@@ -307,7 +310,6 @@ class PortalTeleopBridge:
 
         rtt_ms = None
         with self._obs_lock:
-            self._obs_ts_us = ts_us
             self._last_obs_had_frames = had_frames
             recording = self._recording_enabled
             if q_new is not None:
@@ -341,12 +343,15 @@ class PortalTeleopBridge:
             for name, wrapped in stored_all.items():
                 if wrapped.bgr is not None:
                     rec_frames[name] = np.ascontiguousarray(wrapped.bgr.copy())
-            self._rec_buf.push(RecordingObservation(
-                timestamp_us=int(ts_us),
-                arm_q=None if q_new is None else q_new.copy(),
-                hand_q=None if hand_new is None else hand_new.copy(),
-                frames=rec_frames,
-            ))
+            if rec_frames:
+                self._rec_buf.push(RecordingObservation(
+                    timestamp_us=int(ts_us),
+                    arm_q=None if q_new is None else q_new.copy(),
+                    hand_q=None if hand_new is None else hand_new.copy(),
+                    frames=rec_frames,
+                ))
+        with self._obs_lock:
+            self._obs_ts_us = ts_us
 
     def _on_video_frame(self, track: str, frame) -> None:
         self._merge_display_frames(self._decode_video_frame(track, frame))
@@ -476,7 +481,7 @@ class PortalTeleopBridge:
             vx, vy, vyaw, fsm_id) -> RecordingPair | None:
         """Pop the observation that this action replied to. None if missing."""
         obs = self._rec_buf.take(in_reply_to_ts_us)
-        if obs is None:
+        if obs is None or not obs.frames:
             return None
         return RecordingPair(
             obs=obs,

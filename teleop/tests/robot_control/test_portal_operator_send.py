@@ -115,7 +115,8 @@ def test_send_targets_pairs_recording_obs_by_in_reply_to():
     bridge._recording_enabled = True
     bridge._record_pair_cb = pairs.append
     bridge._rec_buf.push(RecordingObservation(
-        timestamp_us=obs_ts, arm_q=arm.copy(), hand_q=hand.copy(), frames={}))
+        timestamp_us=obs_ts, arm_q=arm.copy(), hand_q=hand.copy(),
+        frames={"head_camera": np.zeros((2, 2, 3), dtype=np.uint8)}))
     bridge.send_targets(arm, hand_q=hand, vx=0.1, vy=0.2, vyaw=0.3, fsm_id=1)
     assert len(pairs) == 1
     pair = pairs[0]
@@ -127,6 +128,20 @@ def test_send_targets_pairs_recording_obs_by_in_reply_to():
     assert pair.vy == 0.2
     assert pair.vyaw == 0.3
     assert pair.fsm_id == 1
+
+
+def test_send_targets_skips_recording_pair_without_frames():
+    bridge = _bridge()
+    pairs = []
+    bridge._obs_ts_us = 3
+    bridge._recording_enabled = True
+    bridge._record_pair_cb = pairs.append
+    bridge._rec_buf.push(RecordingObservation(
+        timestamp_us=3, arm_q=np.zeros(bridge._map.arm_dof),
+        hand_q=np.zeros(bridge._map.hand_dof), frames={}))
+    bridge.send_targets(np.zeros(bridge._map.arm_dof), fsm_id=1)
+    assert pairs == []
+    assert len(bridge._op.calls) == 1
 
 
 def test_send_targets_failed_send_does_not_update_last_sent():

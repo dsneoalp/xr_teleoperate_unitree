@@ -108,8 +108,17 @@ def test_observation_fills_recording_and_display_from_one_decode():
     bridge._recording_enabled = True
     rgb = _solid_rgb(9, 8, 7)
     bridge._on_observation(_FakeObs(42, {TRACK: _FakeFrame(rgb, 42)}))
+    assert bridge.get_last_obs_ts_us() == 42
     head = bridge.get_head_frame()
     assert head.bgr is not None
     obs = bridge._rec_buf.take(42)
     assert obs is not None
     np.testing.assert_array_equal(obs.frames[TRACK][0, 0], head.bgr[0, 0])
+
+
+def test_recording_skips_observation_without_frames():
+    bridge = _video_bridge()
+    bridge._recording_enabled = True
+    bridge._on_observation(_FakeObs(7, {}))
+    assert bridge.get_last_obs_ts_us() == 7
+    assert bridge._rec_buf.take(7) is None

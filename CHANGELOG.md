@@ -2,7 +2,8 @@
 
 ## Portal tick sync (unreleased)
 
-- Robot control loop stamps each Portal `send_state` with a wall-clock `tick_ts`. With video enabled, a one-shot slot lets the video thread attach that same timestamp to exactly one `send_video_frame` without waiting on the loop. `--no-img` still publishes state every control tick.
+- Robot control loop stamps each Portal `send_state` with a wall-clock `tick_ts` at the control rate. Video takes that stamp at most once (`LatestTickSlot`); a pending unused stamp is overwritten so encode lag does not skip state. `--no-img` still publishes state every control tick.
+- Operator recording buffer depth follows Portal `slack` (default 10). `in_reply_to` is published only after a framed observation is buffered; empty-frame observations are not written as episode items.
 - Operator XR display is filled from unmatched `on_video_frame` (low latency) and from matched `obs.frames`, so TeleVuer still updates when tick-synced video never takes the unmatched path. Recording writes one episode item per observation, keyed by `in_reply_to_ts_us == timestamp_us`, and stores both `timestamp_us` (robot tick) and `action_timestamp_us` (operator send).
 - Local `portal_local.yaml` uses MJPEG for `head_camera`. H264 on LiveKit `--dev` arrives without `user_timestamp` and panics the operator receive thread.
 - Operator `send_targets` calls Portal `send_action` on the control thread (same pattern as robot `send_state`); no asyncio hop or send-side latest buffer.
