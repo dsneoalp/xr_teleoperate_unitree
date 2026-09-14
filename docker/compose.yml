@@ -51,12 +51,19 @@ services:
       - /dev/nvmap:/dev/nvmap
       - /dev/nvhost-ctrl:/dev/nvhost-ctrl
       - /dev/nvhost-vic:/dev/nvhost-vic
+      # GPU nodes for headless EGL / VIC blit (present on JP5 G1; no /dev/dri).
+      - /dev/nvhost-gpu:/dev/nvhost-gpu
+      - /dev/nvhost-as-gpu:/dev/nvhost-as-gpu
+      - /dev/nvhost-ctrl-gpu:/dev/nvhost-ctrl-gpu
     env_file:
       - ../teleop/.env
     environment:
       PYTHONUNBUFFERED: "1"
       NVIDIA_VISIBLE_DEVICES: all
-      NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,video,graphics
+      EGL_PLATFORM: device
+      __EGL_VENDOR_LIBRARY_FILENAMES: /usr/share/glvnd/egl_vendor.d/10_nvidia.json
+      __EGL_EXTERNAL_PLATFORM_CONFIG_DIRS: /usr/share/egl/egl_external_platform.d
       SAG_REQUIRE_HW_ENCODE: "1"
       LD_LIBRARY_PATH: /opt/tegra-libs
       RUST_LOG: info
@@ -96,13 +103,21 @@ services:
       - /usr/lib/aarch64-linux-gnu/tegra/libnvvic.so:/opt/tegra-libs/libnvvic.so:ro
       - /usr/lib/aarch64-linux-gnu/tegra/libnvdc.so:/opt/tegra-libs/libnvdc.so:ro
       - /usr/lib/aarch64-linux-gnu/tegra/libnvimp.so:/opt/tegra-libs/libnvimp.so:ro
-      # Without Tegra EGL, nvbuf falls back to CPU blit (bBlitMode=TRUE) at 720p.
+      # Without Tegra EGL + graphics, nvbuf falls back to CPU blit (bBlitMode=TRUE).
       - /usr/lib/aarch64-linux-gnu/tegra-egl/nvidia.json:/usr/share/glvnd/egl_vendor.d/10_nvidia.json:ro
       - /usr/lib/aarch64-linux-gnu/tegra-egl/libEGL_nvidia.so.0:/opt/tegra-libs/libEGL_nvidia.so.0:ro
+      - /usr/lib/aarch64-linux-gnu/tegra-egl/libGLESv1_CM_nvidia.so.1:/opt/tegra-libs/libGLESv1_CM_nvidia.so.1:ro
       - /usr/lib/aarch64-linux-gnu/tegra-egl/libGLESv2_nvidia.so.2:/opt/tegra-libs/libGLESv2_nvidia.so.2:ro
       - /usr/lib/aarch64-linux-gnu/tegra/libnvidia-glsi.so.35.3.1:/opt/tegra-libs/libnvidia-glsi.so.35.3.1:ro
       - /usr/lib/aarch64-linux-gnu/tegra/libnvidia-rmapi-tegra.so.35.3.1:/opt/tegra-libs/libnvidia-rmapi-tegra.so.35.3.1:ro
       - /usr/lib/aarch64-linux-gnu/tegra/libnvidia-eglcore.so.35.3.1:/opt/tegra-libs/libnvidia-eglcore.so.35.3.1:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvidia-glcore.so.35.3.1:/opt/tegra-libs/libnvidia-glcore.so.35.3.1:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvidia-tls.so.35.3.1:/opt/tegra-libs/libnvidia-tls.so.35.3.1:ro
+      # Existing host EGL platform libs (no firmware change). Headless device EGL may still CPU-blit.
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvidia-egl-gbm.so:/opt/tegra-libs/libnvidia-egl-gbm.so.1:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvidia-egl-wayland.so:/opt/tegra-libs/libnvidia-egl-wayland.so.1:ro
+      - /usr/share/egl/egl_external_platform.d/nvidia_gbm.json:/usr/share/egl/egl_external_platform.d/nvidia_gbm.json:ro
+      - /usr/share/egl/egl_external_platform.d/nvidia_wayland.json:/usr/share/egl/egl_external_platform.d/nvidia_wayland.json:ro
     stdin_open: true
     tty: true
     restart: "no"

@@ -7,6 +7,7 @@ No LiveKit, no DDS, no Docker. Run from repo root:
 from __future__ import annotations
 
 import os
+import struct
 import sys
 import tempfile
 import threading
@@ -310,9 +311,11 @@ class ComposeContractTests(unittest.TestCase):
         self.assertEqual(str(env.get("SAG_REQUIRE_HW_ENCODE")), "1")
         self.assertNotIn("PORTAL_REQUIRE_HW_ENCODE", env)
         self.assertIn("video", str(env.get("NVIDIA_DRIVER_CAPABILITIES", "")))
+        self.assertIn("graphics", str(env.get("NVIDIA_DRIVER_CAPABILITIES", "")))
+        self.assertEqual(str(env.get("EGL_PLATFORM")), "device")
         self.assertEqual(str(env.get("NVIDIA_VISIBLE_DEVICES")), "all")
         self.assertEqual(str(env.get("LD_LIBRARY_PATH")), "/opt/tegra-libs")
-        for extra in ("nvmap", "nvhost-ctrl", "nvhost-vic"):
+        for extra in ("nvmap", "nvhost-ctrl", "nvhost-vic", "nvhost-gpu"):
             self.assertTrue(any(extra in d for d in devices), extra)
         groups = {str(g) for g in (robot.get("group_add") or [])}
         for g in ("44", "103", "994"):
@@ -322,6 +325,13 @@ class ComposeContractTests(unittest.TestCase):
         self.assertTrue(any("libnvtvmr.so" in v for v in vols))
         self.assertTrue(any("10_nvidia.json" in v or "nvidia.json" in v for v in vols))
         self.assertTrue(any("libEGL_nvidia" in v for v in vols))
+        self.assertTrue(any("libnvidia-glcore" in v for v in vols))
+        self.assertTrue(any("libnvidia-egl-gbm" in v for v in vols))
+        self.assertEqual(
+            str(env.get("__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS")),
+            "/usr/share/egl/egl_external_platform.d",
+        )
+        self.assertFalse(any("/dev/dri" in d for d in devices))
 
     def test_mock_and_operator_not_fail_closed(self):
         for name in ("mock", "operator"):
@@ -337,11 +347,28 @@ class ComposeContractTests(unittest.TestCase):
 class RgbContractTests(unittest.TestCase):
     def test_video_loop_sends_rgb_not_h264(self):
         loop_path = os.path.join(_teleop_dir, "teleop_robot.py")
+        bgr_path = os.path.join(_teleop_dir, "utils", "bgr_source.py")
         with open(loop_path, "r") as f:
             src = f.read()
-        self.assertIn("rgb = np.ascontiguousarray(head.bgr[:, :, ::-1])", src)
+        with open(bgr_path, "r") as f:
+            src += f.read()
+        self.assertIn("cv2.cvtColor", src)
+        self.assertIn("COLOR_BGR2RGB", src)
+        self.assertIn("bgr_to_rgb", src)
+        self.assertIn("JPEG skipped", src)
+        self.assertIn("_load_local_cam_config", src)
+        self.assertIn("cam_config_server.yaml", src)
+        self.assertIn("BgrCameraSource", src)
+        self.assertIn("bgr_zmq_port", src)
+        self.assertIn("_connect_frame_sources", src)
+        self.assertIn("portal.video_tracks", src)
+        self.assertNotIn("ascontiguousarray(head.bgr", src)
+        self.assertNotIn("cv2.resize", src)
         self.assertIn("portal.send_video_frame(", src)
-        self.assertIn("track, rgb", src)
+        self.assertIn("track, rgb_buf", src)
+        self.assertIn("_send_ms", src)
+        self.assertIn("loop_ms", src)
+        self.assertIn("_log_cam_config", src)
         self.assertIn("EncodeUnavailableError", src)
         self.assertIn("raise SystemExit(1)", src)
 
@@ -350,7 +377,8 @@ class RgbContractTests(unittest.TestCase):
         bgr[..., 0] = 10
         bgr[..., 1] = 20
         bgr[..., 2] = 30
-        rgb = np.ascontiguousarray(bgr[:, :, ::-1])
+        rgb = np.empty_like(bgr)
+        rgb[:] = bgr[:, :, ::-1]
         self.assertEqual(rgb.shape, (h, w, 3))
         self.assertEqual(rgb.dtype, np.uint8)
         np.testing.assert_array_equal(rgb[0, 0], [30, 20, 10])
@@ -361,8 +389,89 @@ class RgbContractTests(unittest.TestCase):
             wire = yaml.safe_load(f)
         videos = wire.get("videos") or []
         self.assertTrue(videos)
-        self.assertEqual(videos[0]["codec"], "h264")
-        self.assertEqual(videos[0]["name"], "head_camera")
+        names = [v["name"] for v in videos]
+        self.assertEqual(names[0], "head_camera")
+        self.assertIn("left_wrist_camera", names)
+        self.assertIn("right_wrist_camera", names)
+        for video in videos:
+            self.assertEqual(video["codec"], "h264")
+
+
+class BgrSourceTests(unittest.TestCase):
+    def test_bgr_zmq_port_offset_and_disabled(self):
+        from teleop.utils.bgr_source import bgr_zmq_port
+
+        cfg = {
+            "head_camera": {"zmq_port": 55555, "enable_bgr_zmq": True},
+            "left_wrist_camera": {"zmq_port": 55556, "enable_bgr_zmq": True},
+        }
+        self.assertEqual(bgr_zmq_port(cfg), 56555)
+        self.assertEqual(bgr_zmq_port(cfg, "left_wrist_camera"), 56556)
+        self.assertIsNone(
+            bgr_zmq_port({"head_camera": {"zmq_port": 55555, "enable_bgr_zmq": False}})
+        )
+        self.assertIsNone(bgr_zmq_port({"head_camera": {"zmq_port": 55555}}))
+        self.assertIsNone(bgr_zmq_port({}))
+
+    def test_parse_bgr_payload_legacy_and_capture_ms(self):
+        from teleop.utils.bgr_source import parse_bgr_payload
+
+        height, width = 720, 1280
+        pixels = bytes(range(256)) * ((height * width * 3 + 255) // 256)
+        pixels = pixels[: height * width * 3]
+        legacy = struct.pack("<HH", height, width) + pixels
+        h, w, ts, raw = parse_bgr_payload(legacy)
+        self.assertEqual((h, w, ts), (720, 1280, None))
+        self.assertEqual(len(raw), height * width * 3)
+
+        stamped = struct.pack("<HH", height, width) + struct.pack("<Q", 42) + pixels
+        h, w, ts, raw = parse_bgr_payload(stamped)
+        self.assertEqual((h, w, ts), (720, 1280, 42))
+        self.assertEqual(len(raw), height * width * 3)
+
+        with self.assertRaises(ValueError):
+            parse_bgr_payload(b"\x00")
+        with self.assertRaises(ValueError):
+            parse_bgr_payload(struct.pack("<HH", 2, 2) + b"\x00")
+
+    def test_even_crop_no_resize(self):
+        from teleop.utils import bgr_source as bgr_mod
+
+        even = np.zeros((720, 1280, 3), dtype=np.uint8)
+        cropped = bgr_mod.even_crop(even)
+        self.assertIs(cropped, even)
+        self.assertEqual(cropped.shape, (720, 1280, 3))
+
+        odd = np.zeros((479, 641, 3), dtype=np.uint8)
+        out = bgr_mod.even_crop(odd)
+        self.assertEqual(out.shape, (478, 640, 3))
+        with open(bgr_mod.__file__, "r", encoding="utf-8") as src_file:
+            src = src_file.read()
+        self.assertNotIn("cv2.resize", src)
+        self.assertNotIn("max_width", src)
+        self.assertNotIn("INTER_AREA", src)
+
+
+class LoopTimingTests(unittest.TestCase):
+    def test_flush_includes_hz(self):
+        from teleop.utils.loop_timing import LoopTiming
+
+        logs: list[str] = []
+
+        class _Log:
+            def info(self, msg):
+                logs.append(msg)
+
+        timing = LoopTiming(_Log(), interval_s=0.0)
+        timing.add("loop_ms", 5.0)
+        timing.add("video_send_ms", 12.5)
+        timing.count("video_new", 3)
+        joined = " ".join(logs)
+        self.assertIn("loop_ms", joined)
+        self.assertIn("video_send_ms", joined)
+        self.assertIn("hz=", joined)
+        self.assertIn("p50=", joined)
+        self.assertIn("video_new", joined)
 
 
 if __name__ == "__main__":
