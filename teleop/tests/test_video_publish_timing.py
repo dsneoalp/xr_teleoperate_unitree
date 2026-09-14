@@ -12,29 +12,35 @@ from teleop.teleop_robot import _video_publish_loop
 class _RecordingTiming:
     def __init__(self):
         self.samples: dict[str, list[float]] = {}
+        self.counts: dict[str, int] = {}
 
     def add(self, name: str, value_ms: float) -> None:
         self.samples.setdefault(name, []).append(float(value_ms))
 
+    def count(self, name: str, n: int = 1) -> None:
+        self.counts[name] = self.counts.get(name, 0) + n
 
-class _FakeHead:
+
+class _FakeSource:
     def __init__(self):
-        self.bgr = np.zeros((8, 8, 3), dtype=np.uint8)
+        self._seq = 0
+        self._rgb = np.zeros((8, 8, 3), dtype=np.uint8)
 
-
-class _FakeImageClient:
-    def get_head_frame(self):
-        return _FakeHead()
+    def latest_rgb(self):
+        self._seq += 1
+        return self._rgb, self._seq
 
 
 class _FakePortal:
     def __init__(self, encode_s: float):
         self.encode_s = encode_s
         self.sends = 0
+        self.stamps = []
 
     def send_video_frame(self, track, frame, timestamp_us=None):
         time.sleep(self.encode_s)
         self.sends += 1
+        self.stamps.append(timestamp_us)
 
 
 def test_video_loop_records_encode_ms():
@@ -45,7 +51,7 @@ def test_video_loop_records_encode_ms():
     timing = _RecordingTiming()
     thread = threading.Thread(
         target=_video_publish_loop,
-        args=(_FakeImageClient(), portal, "head", stop_evt, slot, timing),
+        args=(_FakeSource(), portal, "head", stop_evt, slot, timing),
         daemon=True,
     )
     thread.start()
@@ -66,3 +72,4 @@ def test_video_loop_records_encode_ms():
     assert max(encode_xs) < encode_s * 1000.0 * 3.0
     assert len(timing.samples.get("grab_ms", [])) >= 2
     assert len(timing.samples.get("video_gap_ms", [])) >= 1
+    assert portal.stamps[:2] == [1001, 1002]

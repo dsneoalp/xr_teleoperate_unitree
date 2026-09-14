@@ -1,0 +1,47 @@
+# Mock Portal robot / mock operator: LiveKit only, no Unitree SDK, no Pinocchio.
+# Requires xr-teleop:portal-wheel (see Dockerfile.portal-wheel).
+#   docker compose -f docker/compose.yml build portal-wheel mock
+ARG PORTAL_WHEEL_IMAGE=xr-teleop:portal-wheel
+
+FROM ${PORTAL_WHEEL_IMAGE} AS portal-wheel
+
+FROM python:3.10-slim-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libglib2.0-0 \
+        libgomp1 \
+        libssl3 \
+        libx11-6 \
+        libxext6 \
+        libxfixes3 \
+        libgl1 \
+        libgbm1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=portal-wheel /wheels /tmp/wheels
+RUN pip install --no-cache-dir \
+        "numpy<2.0.0" \
+        pyyaml \
+        python-dotenv \
+        "livekit-api>=0.7" \
+        logging-mp \
+        "opencv-python-headless>=4.8,<4.11" \
+        /tmp/wheels/*.whl \
+    && rm -rf /tmp/wheels
+
+COPY teleop/ /app/teleop/
+WORKDIR /app/teleop
+RUN python -c "from livekit.portal import OperatorConfig, RobotConfig; \
+    OperatorConfig.from_yaml_file('/app/teleop/portal.yaml', 'x'); \
+    RobotConfig.from_yaml_file('/app/teleop/portal.yaml', 'x')"
+
+CMD ["python", "tests/portal_robot_mock.py"]

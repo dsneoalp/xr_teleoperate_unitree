@@ -35,8 +35,9 @@ services:
   operator-mock:
     build:
       context: ..
-      dockerfile: docker/Dockerfile
-      target: mock
+      dockerfile: docker/Dockerfile.mock
+      args:
+        PORTAL_WHEEL_IMAGE: xr-teleop:portal-wheel
     image: xr-teleop:mock
     network_mode: host
     <<: *local-env

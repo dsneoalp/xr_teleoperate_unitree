@@ -1,0 +1,103 @@
+# Operator: README 1.1 conda env tv (micromamba) + Portal wheel.
+# Requires xr-teleop:portal-wheel (see Dockerfile.portal-wheel).
+#   conda create -n tv python=3.10 pinocchio=3.1.0 numpy=1.26.4 -c conda-forge
+ARG PORTAL_WHEEL_IMAGE=xr-teleop:portal-wheel
+ARG TELEIMAGER_REF=57cf2a40572227273fa001cd17833b755331ec97
+ARG TELEVUER_REF=766de45e74373ae0ea66321d942ce538385655a5
+ARG DEX_RETARGETING_REF=d7753d38c9ff11f80bafea6cd168351fd3db9b0e
+
+FROM ${PORTAL_WHEEL_IMAGE} AS portal-wheel
+
+FROM debian:bookworm-slim
+ARG TELEIMAGER_REF
+ARG TELEVUER_REF
+ARG DEX_RETARGETING_REF
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app:/opt/livekit-portal \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    MAMBA_ROOT_PREFIX=/opt/conda \
+    PATH=/opt/conda/bin:$PATH
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        bzip2 \
+        git \
+        libgl1 \
+        libglib2.0-0 \
+        libgomp1 \
+        libsm6 \
+        libxext6 \
+        libxrender1 \
+        libssl3 \
+        libx11-6 \
+        libxfixes3 \
+        libgbm1 \
+        openssl \
+    && curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest \
+        | tar -xvj -C /usr/local bin/micromamba \
+    && micromamba create -y -p /opt/conda -c conda-forge \
+        python=3.10 \
+        pinocchio=3.1.0 \
+        numpy=1.26.4 \
+    && micromamba clean -a -y \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY teleop/ /app/teleop/
+COPY requirements.txt /app/requirements.txt
+COPY assets/g1 /app/assets/g1
+COPY assets/unitree_hand /app/assets/unitree_hand
+
+# Empty submodule dirs in the build context; clone the Superproject gitlink SHAs.
+RUN rm -rf /app/teleop/teleimager /app/teleop/televuer /app/teleop/robot_control/dex-retargeting \
+    && git clone https://github.com/unitreerobotics/teleimager.git /app/teleop/teleimager \
+    && git -C /app/teleop/teleimager checkout "${TELEIMAGER_REF}" \
+    && git clone https://github.com/unitreerobotics/televuer.git /app/teleop/televuer \
+    && git -C /app/teleop/televuer checkout "${TELEVUER_REF}" \
+    && git clone https://github.com/silencht/dex-retargeting.git /app/teleop/robot_control/dex-retargeting \
+    && git -C /app/teleop/robot_control/dex-retargeting checkout "${DEX_RETARGETING_REF}" \
+    && pip install --no-cache-dir -e /app/teleop/teleimager --no-deps \
+    && pip install --no-cache-dir -e /app/teleop/televuer \
+    && pip install --no-cache-dir -e /app/teleop/robot_control/dex-retargeting \
+    && pip install --no-cache-dir -r /app/requirements.txt \
+    && pip install --no-cache-dir \
+        pyyaml \
+        python-dotenv \
+        "livekit-api>=0.7" \
+        logging-mp \
+    && python -c "import pinocchio.casadi" \
+        || micromamba install -y -p /opt/conda -c conda-forge pinocchio=3.1.0 numpy=1.26.4 \
+    && python -c "import pinocchio.casadi; import torch; from dex_retargeting import RetargetingConfig" \
+    && micromamba clean -a -y \
+    && rm -f /usr/local/bin/micromamba \
+    && apt-get purge -y curl bzip2 \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/* /root/.cache/pip
+
+# vuer==0.0.60 (from televuer) needs params-proto 2.x; current PyPI 3.3 drops Flag.
+RUN pip install --no-cache-dir "params-proto==2.13.2" \
+    && rm -rf /root/.cache/pip
+
+COPY --from=portal-wheel /wheels /tmp/wheels
+RUN pip install --no-cache-dir /tmp/wheels/*.whl \
+    && python -c "from livekit.portal import OperatorConfig, RobotConfig; \
+        OperatorConfig.from_yaml_file('/app/teleop/portal.yaml', 'x'); \
+        RobotConfig.from_yaml_file('/app/teleop/portal.yaml', 'x')" \
+    && rm -rf /tmp/wheels /root/.cache/pip
+
+COPY docker/entrypoint-operator.sh /entrypoint-operator.sh
+RUN chmod +x /entrypoint-operator.sh \
+    && mkdir -p /certs
+
+WORKDIR /app/teleop
+
+ENV PYTHONPATH=/app \
+    XR_TELEOP_CERT=/certs/cert.pem \
+    XR_TELEOP_KEY=/certs/key.pem
+
+ENTRYPOINT ["/entrypoint-operator.sh"]
+CMD ["--arm", "G1_29", "--ee", "dex3", "--input-mode", "hand"]

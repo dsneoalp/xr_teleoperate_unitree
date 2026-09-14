@@ -1,0 +1,106 @@
+# G1 / Jetson overlay. Does not set --require-hw-encode; pass it at run time.
+#
+#   ./docker/run.sh build-g1
+#   ./docker/run.sh robot-g1 --require-hw-encode
+#
+# Combine with compose.yml from the repo root:
+#   docker compose -f docker/compose.yml -f docker/compose.g1.yml build robot-g1
+
+name: xr-teleop
+
+services:
+  robot-g1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.robot-g1
+      args:
+        LAB_JETSON_IMAGE: neox/portal-robot:lab-jetson
+    image: xr-teleop:robot-g1
+    network_mode: host
+    runtime: nvidia
+    # GIDs: Debian slim has no host group names render/debug. Tegra drivers
+    # check supplementary GIDs (video/render/debug), not root DAC.
+    group_add:
+      - "44"   # video
+      - "103"  # render
+      - "994"  # debug
+    devices:
+      - /dev/nvhost-msenc:/dev/nvhost-msenc
+      - /dev/nvmap:/dev/nvmap
+      - /dev/nvhost-ctrl:/dev/nvhost-ctrl
+      - /dev/nvhost-vic:/dev/nvhost-vic
+      # GPU nodes for headless EGL / VIC blit (present on JP5 G1; no /dev/dri).
+      - /dev/nvhost-gpu:/dev/nvhost-gpu
+      - /dev/nvhost-as-gpu:/dev/nvhost-as-gpu
+      - /dev/nvhost-ctrl-gpu:/dev/nvhost-ctrl-gpu
+    env_file:
+      - ../teleop/.env
+    environment:
+      PYTHONUNBUFFERED: "1"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,video,graphics
+      EGL_PLATFORM: device
+      __EGL_VENDOR_LIBRARY_FILENAMES: /usr/share/glvnd/egl_vendor.d/10_nvidia.json
+      __EGL_EXTERNAL_PLATFORM_CONFIG_DIRS: /usr/share/egl/egl_external_platform.d
+      LD_LIBRARY_PATH: /opt/tegra-libs
+      RUST_LOG: info
+    volumes:
+      - ../teleop:/app/teleop
+      - /etc/nv_tegra_release:/etc/nv_tegra_release:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvbuf_fdmap.so.1.0.0:/opt/tegra-libs/libnvbuf_fdmap.so.1.0.0:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvbufsurface.so.1.0.0:/opt/tegra-libs/libnvbufsurface.so.1.0.0:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvbufsurftransform.so.1.0.0:/opt/tegra-libs/libnvbufsurftransform.so.1.0.0:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvbuf_utils.so.1.0.0:/opt/tegra-libs/libnvbuf_utils.so.1.0.0:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvos.so:/opt/tegra-libs/libnvos.so:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvrm_chip.so:/opt/tegra-libs/libnvrm_chip.so:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvrm_gpu.so:/opt/tegra-libs/libnvrm_gpu.so:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvrm_host1x.so:/opt/tegra-libs/libnvrm_host1x.so:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvrm_mem.so:/opt/tegra-libs/libnvrm_mem.so:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvrm_stream.so:/opt/tegra-libs/libnvrm_stream.so:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvrm_surface.so:/opt/tegra-libs/libnvrm_surface.so:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvrm_sync.so:/opt/tegra-libs/libnvrm_sync.so:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvcucompat.so:/opt/tegra-libs/libnvcucompat.so:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvv4l2.so:/opt/tegra-libs/libv4l2.so.0:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvv4lconvert.so:/opt/tegra-libs/libv4lconvert.so.0:ro
+      - /usr/lib/aarch64-linux-gnu/libv4l/plugins/nv/libv4l2_nvvideocodec.so:/usr/lib/aarch64-linux-gnu/libv4l/plugins/nv/libv4l2_nvvideocodec.so:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libtegrav4l2.so:/opt/tegra-libs/libtegrav4l2.so:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvmmlite.so:/opt/tegra-libs/libnvmmlite.so:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvmmlite_utils.so:/opt/tegra-libs/libnvmmlite_utils.so:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvmmlite_video.so:/opt/tegra-libs/libnvmmlite_video.so:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvmm_utils.so:/opt/tegra-libs/libnvmm_utils.so:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvtvmr.so:/opt/tegra-libs/libnvtvmr.so:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvvideoencode_ppe.so:/opt/tegra-libs/libnvvideoencode_ppe.so:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvvideo.so:/opt/tegra-libs/libnvvideo.so:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvmedia.so:/opt/tegra-libs/libnvmedia.so:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvparser.so:/opt/tegra-libs/libnvparser.so:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvddk_2d_v2.so:/opt/tegra-libs/libnvddk_2d_v2.so:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvddk_vic.so:/opt/tegra-libs/libnvddk_vic.so:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvsciipc.so:/opt/tegra-libs/libnvsciipc.so:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvsocsys.so:/opt/tegra-libs/libnvsocsys.so:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvvic.so:/opt/tegra-libs/libnvvic.so:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvdc.so:/opt/tegra-libs/libnvdc.so:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvimp.so:/opt/tegra-libs/libnvimp.so:ro
+      # Without Tegra EGL, nvbuf falls back to CPU blit (bBlitMode=TRUE) at 720p.
+      - /usr/lib/aarch64-linux-gnu/tegra-egl/nvidia.json:/usr/share/glvnd/egl_vendor.d/10_nvidia.json:ro
+      - /usr/lib/aarch64-linux-gnu/tegra-egl/libEGL_nvidia.so.0:/opt/tegra-libs/libEGL_nvidia.so.0:ro
+      - /usr/lib/aarch64-linux-gnu/tegra-egl/libGLESv1_CM_nvidia.so.1:/opt/tegra-libs/libGLESv1_CM_nvidia.so.1:ro
+      - /usr/lib/aarch64-linux-gnu/tegra-egl/libGLESv2_nvidia.so.2:/opt/tegra-libs/libGLESv2_nvidia.so.2:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvidia-glsi.so.35.3.1:/opt/tegra-libs/libnvidia-glsi.so.35.3.1:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvidia-rmapi-tegra.so.35.3.1:/opt/tegra-libs/libnvidia-rmapi-tegra.so.35.3.1:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvidia-eglcore.so.35.3.1:/opt/tegra-libs/libnvidia-eglcore.so.35.3.1:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvidia-glcore.so.35.3.1:/opt/tegra-libs/libnvidia-glcore.so.35.3.1:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvidia-tls.so.35.3.1:/opt/tegra-libs/libnvidia-tls.so.35.3.1:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvidia-egl-gbm.so:/opt/tegra-libs/libnvidia-egl-gbm.so.1:ro
+      - /usr/lib/aarch64-linux-gnu/tegra/libnvidia-egl-wayland.so:/opt/tegra-libs/libnvidia-egl-wayland.so.1:ro
+      - /usr/share/egl/egl_external_platform.d/nvidia_gbm.json:/usr/share/egl/egl_external_platform.d/nvidia_gbm.json:ro
+      - /usr/share/egl/egl_external_platform.d/nvidia_wayland.json:/usr/share/egl/egl_external_platform.d/nvidia_wayland.json:ro
+    stdin_open: true
+    tty: true
+    restart: "no"
+    command:
+      - python
+      - teleop_robot.py
+      - --ee
+      - dex3
+      - --arm
+      - G1_29

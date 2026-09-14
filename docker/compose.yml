@@ -1,57 +1,64 @@
 # Operator on the server, robot/mock on host network so LIVEKIT_URL=ws://127.0.0.1:7880 works.
 # From repo root:
-#   docker compose -f docker/compose.yml build mock operator robot
+#   ./docker/run.sh build
 #   docker compose -f docker/compose.yml up mock
 #   docker compose -f docker/compose.yml run --rm -it operator
 #
-# Local LiveKit + portal_local.yaml: docker/compose.local.yml and docker/README.md
+# PC robot image: Dockerfile.robot (Python 3.10 software Portal).
+# G1 robot image: docker/compose.g1.yml + Dockerfile.robot-g1.
+# Local LiveKit: docker/compose.local.yml and docker/README.md.
 
 # teleop/ is bind-mounted so host edits apply on container restart (no rebuild).
-# New pip deps or Dockerfile changes still need: docker compose -f docker/compose.yml build
+# New pip deps or Dockerfile changes still need: ./docker/run.sh build
 
 name: xr-teleop
 
-x-portal-build: &portal-build
-  context: ..
-  dockerfile: docker/Dockerfile
+x-common: &common
+  network_mode: host
+  env_file:
+    - ../teleop/.env
+  environment:
+    PYTHONUNBUFFERED: "1"
+  volumes:
+    - ../teleop:/app/teleop
+  stdin_open: true
+  tty: true
+  restart: "no"
 
 services:
+  portal-wheel:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.portal-wheel
+    image: xr-teleop:portal-wheel
+    profiles: ["wheel"]
+    command: ["true"]
+    restart: "no"
+
   mock:
     build:
-      <<: *portal-build
-      target: mock
+      context: ..
+      dockerfile: docker/Dockerfile.mock
+      args:
+        PORTAL_WHEEL_IMAGE: xr-teleop:portal-wheel
     image: xr-teleop:mock
-    network_mode: host
-    env_file:
-      - ../teleop/.env
-    environment:
-      PYTHONUNBUFFERED: "1"
-    volumes:
-      - ../teleop:/app/teleop
-    stdin_open: true
-    tty: true
-    restart: "no"
+    <<: *common
 
   robot:
     build:
-      <<: *portal-build
-      target: robot
+      context: ..
+      dockerfile: docker/Dockerfile.robot
+      args:
+        PORTAL_WHEEL_IMAGE: xr-teleop:portal-wheel
     image: xr-teleop:robot
-    network_mode: host
-    env_file:
-      - ../teleop/.env
-    environment:
-      PYTHONUNBUFFERED: "1"
-    volumes:
-      - ../teleop:/app/teleop
-    stdin_open: true
-    tty: true
-    restart: "no"
+    <<: *common
 
   operator:
     build:
-      <<: *portal-build
-      target: operator
+      context: ..
+      dockerfile: docker/Dockerfile.operator
+      args:
+        PORTAL_WHEEL_IMAGE: xr-teleop:portal-wheel
     image: xr-teleop:operator
     network_mode: host
     env_file:

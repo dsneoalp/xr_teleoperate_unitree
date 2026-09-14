@@ -2,29 +2,45 @@
 
 No TeleVuer / IK. Pair with teleop_operator.py in the same LiveKit room.
 
+Control loop is the clock: one tick_ts for send_state and every video track.
+Camera ingest (BGR ZMQ / JPEG fallback) comes from hw_encoder; pacing does not.
+
     python teleop/teleop_robot.py --ee dex3 --arm G1_29
     python teleop/teleop_robot.py --ee dex3 --arm G1_29 --motion
     python teleop/teleop_robot.py --ee dex3 --arm G1_29 --sim
+    python teleop/teleop_robot.py --ee dex3 --arm G1_29 --require-hw-encode
 """
 import time
 import math
 import argparse
 import threading
 import logging_mp
-logging_mp.basicConfig(level=logging_mp.INFO)
+try:
+    logging_mp.basicConfig(level=logging_mp.INFO)
+except RuntimeError:
+    pass
 logger_mp = logging_mp.getLogger(__name__)
 
 import os
 import sys
 import numpy as np
+import yaml
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 
+from teleop.robot_control.encode import EncodeUnavailableError
 from teleop.robot_control.portal_robot import PortalRobotTransport
 from teleop.robot_control.portal_mapping import UnpackedAction
 from teleop.robot_control.tick_slot import LatestTickSlot, now_us
+from teleop.utils.bgr_source import (
+    BgrCameraSource,
+    bgr_to_rgb,
+    bgr_zmq_port,
+    even_crop,
+    fetch_teleimager_config,
+)
 from teleop.utils.loop_timing import LoopTiming
 from teleop.utils.arm_stiffness import ARM_STIFFNESS_FADE_S
 
@@ -78,37 +94,144 @@ def filter_cmd(state, q_cmd, dt, tau):
     return q
 
 
-def _connect_image_client(host: str):
-    """Subscribe to the teleimager ZMQ server; retry while it starts."""
-    from teleimager.image_client import ImageClient
+def _local_cam_config_paths():
+    """Bind-mounted teleop YAMLs. site-packages ZMQ_Requester looks two dirs above
+    image_client.py and misses these when GET_DATA on :60000 times out."""
+    return (
+        os.path.join(current_dir, "teleimager", "cam_config_client.yaml"),
+        os.path.join(current_dir, "teleimager", "cam_config_server.yaml"),
+        os.path.join(current_dir, "utils", "portal_cam_config.yaml"),
+    )
 
-    last_error = None
-    for attempt in range(1, IMAGE_CLIENT_RETRIES + 1):
+
+def _load_local_cam_config():
+    for path in _local_cam_config_paths():
+        if not os.path.isfile(path):
+            continue
         try:
-            client = ImageClient(host=host, request_bgr=True)
-            logger_mp.info(f"ImageClient connected to {host} (attempt {attempt})")
-            return client
+            with open(path, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f)
         except Exception as exc:
-            last_error = exc
-            time.sleep(IMAGE_CLIENT_RETRY_S)
-    logger_mp.warning(f"ImageClient failed after {IMAGE_CLIENT_RETRIES} tries: {last_error}")
+            logger_mp.warning(f"Failed to load local {path}: {exc}")
+            continue
+        if cfg:
+            logger_mp.info(f"Loaded camera config from local {path}")
+            return cfg
     return None
 
 
-def _video_publish_loop(img_client, portal, track, stop_evt, tick_slot: LatestTickSlot,
+def _log_cam_config(cfg):
+    """Log teleimager slots (shape is [H, W])."""
+    logger_mp.info(f"teleimager cam_config:\n{yaml.safe_dump(cfg, sort_keys=False).rstrip()}")
+
+
+class _JpegSlotSource:
+    """JPEG fallback for one teleimager slot when raw BGR is unavailable."""
+
+    def __init__(self, host: str, cam_config, slot: str, request_bgr: bool = True):
+        from teleimager.image_client import ZMQ_SubscriberManager
+
+        self._host = host
+        self._slot = slot
+        self._request_bgr = request_bgr
+        self._cam_config = cam_config
+        self._rgb_buf = None
+        self._seq = 0
+        self._subscriber_manager = ZMQ_SubscriberManager.get_instance()
+        cam = self._cam_config.get(slot) or {}
+        if not cam.get("enable_zmq"):
+            logger_mp.warning(
+                f"[Image Client] {slot} ZMQ is not enabled; track will not publish"
+            )
+            return
+        port = cam["zmq_port"]
+        self._subscriber_manager.subscribe(host, port, request_bgr=request_bgr)
+        logger_mp.info(f"JPEG ZMQ '{slot}' {host}:{port} (BGR unavailable)")
+
+    def latest_rgb(self):
+        cam = self._cam_config[self._slot]
+        frame = self._subscriber_manager.subscribe(
+            self._host, cam["zmq_port"], request_bgr=self._request_bgr
+        )
+        if frame is None or getattr(frame, "bgr", None) is None:
+            return None
+        rgb = bgr_to_rgb(even_crop(frame.bgr), self._rgb_buf)
+        self._rgb_buf = rgb
+        self._seq += 1
+        return rgb, self._seq
+
+    def close(self):
+        logger_mp.info(f"JPEG source '{self._slot}' closed.")
+
+
+def _connect_frame_sources(host: str, tracks):
+    """One ingest per portal.yaml video track. BGR ZMQ preferred, JPEG fallback."""
+    last_error = None
+    for attempt in range(1, IMAGE_CLIENT_RETRIES + 1):
+        try:
+            cfg = fetch_teleimager_config(host)
+            if cfg is not None:
+                logger_mp.info(f"Received camera config from server {host}:60000")
+                _log_cam_config(cfg)
+            else:
+                cfg = _load_local_cam_config()
+                if cfg is not None:
+                    _log_cam_config(cfg)
+            if cfg is None:
+                raise RuntimeError("Failed to get camera configuration.")
+            sources = {}
+            try:
+                for track in tracks:
+                    port = bgr_zmq_port(cfg, track)
+                    if port is not None:
+                        source = BgrCameraSource(host, port, slot=track)
+                        source.start()
+                        sources[track] = source
+                        logger_mp.info(
+                            f"track '{track}' BGR {host}:{port} (attempt {attempt})"
+                        )
+                        continue
+                    slot = cfg.get(track) if isinstance(cfg.get(track), dict) else None
+                    if slot and slot.get("enable_zmq"):
+                        sources[track] = _JpegSlotSource(
+                            host=host, cam_config=cfg, slot=track, request_bgr=True
+                        )
+                        logger_mp.info(
+                            f"track '{track}' JPEG fallback (attempt {attempt})"
+                        )
+                        continue
+                    logger_mp.warning(
+                        f"portal track '{track}' has no teleimager BGR/JPEG source; skip"
+                    )
+                if sources:
+                    return sources
+                raise RuntimeError("No video sources matched portal.yaml tracks.")
+            except Exception:
+                for source in sources.values():
+                    try:
+                        source.close()
+                    except Exception:
+                        pass
+                raise
+        except Exception as exc:
+            last_error = exc
+            time.sleep(IMAGE_CLIENT_RETRY_S)
+    logger_mp.warning(
+        f"ImageClient failed after {IMAGE_CLIENT_RETRIES} tries: {last_error}"
+    )
+    return {}
+
+
+def _video_publish_loop(frame_source, portal, track, stop_evt, tick_slot: LatestTickSlot,
                        timing: LoopTiming | None = None):
-    """Wait for a control-loop tick, grab the latest ZMQ frame, stamp it once.
+    """Wait for a control-loop tick, grab latest RGB, stamp it once.
 
     Pacing comes from the control loop via the slot, not a second 1/fps sleep.
-    No frame: the consumed timestamp is not reused; Portal drops or matches
-    that state without a frame.
-
-    ``[timing-video]`` (1 Hz): ``grab_ms`` is ZMQ get_head_frame; ``encode_ms``
-    is the blocking ``send_video_frame`` (H264 + LiveKit); ``video_gap_ms`` is
-    start-to-start interval of successful publishes (~1000 / p50 = video Hz).
+    Duplicate source seq is skipped; the consumed timestamp is not reused.
     """
     logged = False
     skip_count = 0
+    last_seq = -1
     timing = timing or LoopTiming(logger_mp, prefix="[timing-video]")
     last_encode_t = None
     while not stop_evt.is_set():
@@ -117,31 +240,61 @@ def _video_publish_loop(img_client, portal, track, stop_evt, tick_slot: LatestTi
             continue
         try:
             grab_t0 = time.perf_counter()
-            head = img_client.get_head_frame()
+            item = frame_source.latest_rgb()
             grab_ms = (time.perf_counter() - grab_t0) * 1000.0
-            has_frame = head is not None and getattr(head, "bgr", None) is not None
-            if has_frame:
-                rgb = np.ascontiguousarray(head.bgr[:, :, ::-1])
-                encode_t0 = time.perf_counter()
-                if last_encode_t is not None:
-                    timing.add("video_gap_ms", (encode_t0 - last_encode_t) * 1000.0)
-                last_encode_t = encode_t0
-                portal.send_video_frame(track, rgb, timestamp_us=ts)
-                timing.add("grab_ms", grab_ms)
-                timing.add("encode_ms", (time.perf_counter() - encode_t0) * 1000.0)
-                skip_count = 0
-                if not logged:
-                    h, w = rgb.shape[:2]
-                    logger_mp.info(f"publishing '{track}' {w}x{h} (video thread)")
-                    logged = True
-            else:
+            if item is None:
                 skip_count += 1
                 if skip_count == 1 or skip_count % VIDEO_SKIP_LOG_EVERY == 0:
                     logger_mp.debug(
                         f"video skip: no camera frame for tick {ts} "
-                        f"(skips={skip_count})")
+                        f"track={track} (skips={skip_count})")
+                continue
+            rgb_buf, seq = item
+            if seq == last_seq:
+                timing.count(f"{track}_dup")
+                continue
+            if last_seq >= 0:
+                skipped = seq - last_seq - 1
+                if skipped > 0:
+                    timing.count(f"{track}_src_skipped", skipped)
+            last_seq = seq
+            timing.count(f"{track}_new")
+            encode_t0 = time.perf_counter()
+            if last_encode_t is not None:
+                timing.add("video_gap_ms", (encode_t0 - last_encode_t) * 1000.0)
+            last_encode_t = encode_t0
+            portal.send_video_frame(track, rgb_buf, timestamp_us=ts)
+            timing.add("grab_ms", grab_ms)
+            timing.add("encode_ms", (time.perf_counter() - encode_t0) * 1000.0)
+            skip_count = 0
+            if not logged:
+                h, w = rgb_buf.shape[:2]
+                logger_mp.info(f"publishing '{track}' {w}x{h} (video thread)")
+                logged = True
+        except EncodeUnavailableError as exc:
+            logger_mp.error(f"video thread HW encode DoD failed: {exc}")
+            stop_evt.set()
+            return
         except Exception as exc:
             logger_mp.warning(f"video thread: {exc}")
+
+
+def _video_publish_loop_maybe_profile(frame_source, portal, track, stop_evt, tick_slot, timing):
+    """Optional cProfile around the video thread when SAG_PROFILE_VIDEO=1."""
+    if os.environ.get("SAG_PROFILE_VIDEO", "0") != "1":
+        _video_publish_loop(frame_source, portal, track, stop_evt, tick_slot, timing)
+        return
+    import cProfile
+
+    profiler = cProfile.Profile()
+    profiler.enable()
+    try:
+        _video_publish_loop(frame_source, portal, track, stop_evt, tick_slot, timing)
+    finally:
+        profiler.disable()
+        dump_path = os.environ.get("SAG_PROFILE_VIDEO_PATH", "/tmp/teleop_video.cprof")
+        profiler.dump_stats(dump_path)
+        logger_mp.info(f"video thread cProfile dumped to {dump_path}")
 
 
 if __name__ == '__main__':
@@ -167,6 +320,10 @@ if __name__ == '__main__':
     parser.add_argument('--portal-identity', type=str, default='xr-robot')
     parser.add_argument('--cmd-tau', type=float, default=0.3,
                         help='command smoothing time (s); 0 = off. Switch interp/filter in the TELEOP loop.')
+    parser.add_argument(
+        '--require-hw-encode', action='store_true',
+        help='Fail-closed Jetson MMAPI encode (nvhost-msenc FD + FFI log). '
+             'Off by default so PC/sim/mock keep software encode.')
     args = parser.parse_args()
 
     from unitree_sdk2py.core.channel import ChannelFactoryInitialize
@@ -186,7 +343,6 @@ if __name__ == '__main__':
 
     arm_ctrl = G1_29_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
 
-    # DDS apply only. XR→Dex3 retargeting runs on the operator; actions arrive as hand_q.
     hand_ctrl = None
     if args.ee == "dex3":
         from teleop.robot_control.robot_hand_unitree import Dex3_1_Controller
@@ -198,27 +354,37 @@ if __name__ == '__main__':
         env_file=args.env_file,
         identity=args.portal_identity,
         room=args.livekit_room,
-        url=args.livekit_url)
+        url=args.livekit_url,
+        require_hw_encode=args.require_hw_encode)
     portal.wait_until_connected()
-
-    img_client = None if args.no_img else _connect_image_client(args.img_server_ip)
-    video_track = portal.video_tracks[0] if portal.video_tracks else None
-    video_stop = threading.Event()
-    video_thread = None
-    tick_slot = None
-    if img_client is not None and video_track:
-        tick_slot = LatestTickSlot()
-        video_thread = threading.Thread(
-            target=_video_publish_loop,
-            args=(img_client, portal, video_track, video_stop, tick_slot),
-            daemon=True)
-        video_thread.start()
-        logger_mp.info("video publish thread started")
 
     lock = threading.Lock()
     latest = {'action': None, 'wall': 0.0}
     applied_fsm = FSM_IDLE
     timing = LoopTiming(logger_mp)
+
+    img_sources = {} if args.no_img else _connect_frame_sources(
+        args.img_server_ip, portal.video_tracks
+    )
+    video_stop = threading.Event()
+    video_threads = []
+    tick_slots: list[LatestTickSlot] = []
+    for i, (track, source) in enumerate(img_sources.items()):
+        slot = LatestTickSlot()
+        tick_slots.append(slot)
+        target = (
+            _video_publish_loop_maybe_profile if i == 0 else _video_publish_loop
+        )
+        thread = threading.Thread(
+            target=target,
+            args=(source, portal, track, video_stop, slot, timing),
+            name=f"video-{track}",
+            daemon=True)
+        thread.start()
+        video_threads.append(thread)
+    if video_threads:
+        logger_mp.info(f"video publish threads started: {list(img_sources)}")
+
     last_action_wall = {'t': 0.0}
     arm_cmd = {}
     hand_cmd = {}
@@ -279,7 +445,6 @@ if __name__ == '__main__':
                 if hand_ctrl is not None and action.hand_q.size:
                     half = action.hand_q.size // 2
                     hand_q = action.hand_q
-                    # hand_q = interp_cmd(hand_cmd, action.hand_q, start, args.cmd_tau)
                     hand_ctrl.ctrl_dual_hand(hand_q[:half], hand_q[half:])
                 applied_fsm = FSM_HAND_SETUP
             elif present and fsm == FSM_TELEOP and action:
@@ -291,15 +456,11 @@ if __name__ == '__main__':
                     if hand_ctrl is not None:
                         hand_cmd['q'] = np.asarray(hand_ctrl.get_current_dual_hand_q(), dtype=float).copy()
                 tauff = np.zeros_like(action.arm_q)
-                # pick one (arm + hand must match):
-                # arm_q = action.arm_q
-                # arm_q = interp_cmd(arm_cmd, action.arm_q, start, args.cmd_tau)
                 arm_q = filter_cmd(arm_cmd, action.arm_q, dt, args.cmd_tau)
                 arm_ctrl.ctrl_dual_arm(arm_q, tauff)
                 if hand_ctrl is not None and action.hand_q.size:
                     half = action.hand_q.size // 2
                     hand_q = interp_cmd(hand_cmd, action.hand_q, start, args.cmd_tau)
-                    # hand_q = filter_cmd(hand_cmd, action.hand_q, dt, args.cmd_tau)
                     hand_ctrl.ctrl_dual_hand(hand_q[:half], hand_q[half:])
                 applied_fsm = FSM_TELEOP
             elif present:
@@ -326,20 +487,31 @@ if __name__ == '__main__':
             tick_ts = now_us()
             portal.send_state(motor_q=motor_q, hand_q=hand_q, fsm_id=fsm,
                               timestamp_us=tick_ts)
-            if tick_slot is not None:
-                if not tick_slot.offer(tick_ts):
-                    video_overwrites += 1
-                    if video_overwrites == 1 or video_overwrites % VIDEO_OVERWRITE_LOG_EVERY == 0:
-                        logger_mp.info(
-                            f"video still encoding, offered newer tick "
-                            f"(overwrites={video_overwrites})")
-                elif video_overwrites:
+            replaced_any = False
+            for slot in tick_slots:
+                if not slot.offer(tick_ts):
+                    replaced_any = True
+            if replaced_any:
+                video_overwrites += 1
+                if video_overwrites == 1 or video_overwrites % VIDEO_OVERWRITE_LOG_EVERY == 0:
                     logger_mp.info(
-                        f"video caught up after {video_overwrites} overwritten ticks")
-                    video_overwrites = 0
+                        f"video still encoding, offered newer tick "
+                        f"(overwrites={video_overwrites})")
+            elif video_overwrites:
+                logger_mp.info(
+                    f"video caught up after {video_overwrites} overwritten ticks")
+                video_overwrites = 0
 
+            hw_err = portal.hw_encode_error
+            if hw_err is not None:
+                raise hw_err
+
+            timing.add("loop_ms", (time.time() - start) * 1000.0)
             sleep = max(0.0, (1.0 / args.frequency) - (time.time() - start))
             time.sleep(sleep)
+    except EncodeUnavailableError as exc:
+        logger_mp.error(f"HW encode DoD failed: {exc}")
+        raise SystemExit(1) from exc
     except KeyboardInterrupt:
         logger_mp.info("KeyboardInterrupt, exiting ...")
     finally:
@@ -355,7 +527,6 @@ if __name__ == '__main__':
                 logger_mp.info(f"Exit debug / SelectMode('ai'): status={status} result={result}")
                 _, mode = motion_switcher.msc.CheckMode()
                 logger_mp.info(f"CheckMode after exit: {mode}")
-                
         except Exception as e:
             logger_mp.error(f"Exit debug mode failed: {e}")
         try:
@@ -363,11 +534,11 @@ if __name__ == '__main__':
         except Exception as e:
             logger_mp.error(f"portal close failed: {e}")
         video_stop.set()
-        if video_thread is not None:
-            video_thread.join(timeout=2.0)
-        if img_client is not None:
+        for thread in video_threads:
+            thread.join(timeout=2.0)
+        for source in img_sources.values():
             try:
-                img_client.close()
+                source.close()
             except Exception as e:
-                logger_mp.error(f"ImageClient close failed: {e}")
+                logger_mp.error(f"video source close failed: {e}")
         logger_mp.info("robot exited.")

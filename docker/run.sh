@@ -2,6 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 COMPOSE=(docker compose -f docker/compose.yml)
+G1_COMPOSE=(docker compose -f docker/compose.yml -f docker/compose.g1.yml)
 LOCAL_COMPOSE=(docker compose -f docker/compose.yml -f docker/compose.local.yml)
 
 require_env_local() {
@@ -12,10 +13,12 @@ require_env_local() {
 }
 
 usage() {
-  echo "usage: $0 {build|operator|robot|mock|local|local-livekit|local-robot|local-operator} [args...]"
-  echo "  build           docker compose -f docker/compose.yml build mock operator robot"
+  echo "usage: $0 {build|build-g1|operator|robot|robot-g1|mock|local|local-livekit|local-robot|local-operator} [args...]"
+  echo "  build           portal-wheel + mock + operator + robot (PC / software encode)"
+  echo "  build-g1        robot-g1 (Jetson MMAPI FFI; build on the G1)"
   echo "  operator        interactive operator (production .env / portal.yaml)"
-  echo "  robot           G1 DDS robot loop (production .env / portal.yaml)"
+  echo "  robot           PC robot loop (no --require-hw-encode)"
+  echo "  robot-g1        G1 robot; pass --require-hw-encode to fail-closed HW encode"
   echo "  mock            LiveKit echo robot"
   echo "  local           LiveKit --dev + mock robot + mock operator"
   echo "  local-livekit   LiveKit --dev only"
@@ -28,13 +31,27 @@ cmd="${1:-}"
 shift || true
 case "$cmd" in
   build)
+    "${COMPOSE[@]}" --profile wheel build portal-wheel
     "${COMPOSE[@]}" build mock operator robot "$@"
+    ;;
+  build-g1)
+    "${G1_COMPOSE[@]}" build robot-g1 "$@"
     ;;
   operator)
     "${COMPOSE[@]}" run --rm -it operator "$@"
     ;;
   robot)
     "${COMPOSE[@]}" run --rm robot "$@"
+    ;;
+  robot-g1)
+    if [[ $# -eq 0 ]]; then
+      "${G1_COMPOSE[@]}" run --rm --no-deps robot-g1
+    elif [[ "${1:-}" == python || "${1:-}" == bash ]]; then
+      "${G1_COMPOSE[@]}" run --rm --no-deps robot-g1 "$@"
+    else
+      "${G1_COMPOSE[@]}" run --rm --no-deps robot-g1 \
+        python teleop_robot.py --ee dex3 --arm G1_29 "$@"
+    fi
     ;;
   mock)
     "${COMPOSE[@]}" run --rm mock "$@"

@@ -48,23 +48,23 @@ class LoopTiming:
         self._samples = {}
         self._counts = {}
         parts = []
+        hz_den = elapsed if elapsed > 0 else 1e-9
         for name in sorted(samples):
             xs = samples[name]
             xs.sort()
             parts.append(
-                f"{name} n={len(xs)} p50={_percentile(xs, 50):.1f} "
+                f"{name} n={len(xs)} hz={len(xs) / hz_den:.1f} "
+                f"p50={_percentile(xs, 50):.1f} "
                 f"p95={_percentile(xs, 95):.1f} max={xs[-1]:.1f}"
             )
         loops = counts.pop("loops", 0)
         stale = counts.pop("stale", 0)
         if loops:
-            hz = loops / elapsed if elapsed > 0 else 0.0
-            parts.append(f"stale_frac={stale / loops:.2f} hz={hz:.1f}")
+            parts.append(f"stale_frac={stale / loops:.2f} hz={loops / hz_den:.1f}")
         elif stale:
             counts["stale"] = stale
         for name in sorted(counts):
             n = counts[name]
-            hz = n / elapsed if elapsed > 0 else 0.0
-            parts.append(f"{name} n={n} hz={hz:.1f}")
+            parts.append(f"{name} n={n} hz={n / hz_den:.1f}")
         if parts:
             self._log.info(f"{self._prefix} " + " | ".join(parts))
