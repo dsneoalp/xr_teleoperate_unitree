@@ -59,6 +59,8 @@ services:
     volumes:
       - ../teleop:/app/teleop
       - ../assets:/app/assets
+      - ../tests:/app/tests
+      - ../pytest.ini:/app/pytest.ini
       - operator-certs:/certs
     shm_size: "256mb"
     stdin_open: true

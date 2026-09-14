@@ -24,6 +24,7 @@ sys.path.append(parent_dir)
 
 from teleop.robot_control.portal_robot import PortalRobotTransport
 from teleop.robot_control.portal_mapping import UnpackedAction
+from teleop.utils.portal_sync import capture_tick_us
 
 
 def _test_pattern(h: int, w: int, t: float) -> np.ndarray:
@@ -82,13 +83,16 @@ if __name__ == '__main__':
             with lock:
                 action = latest['action']
                 n = latest['count']
+            tick_us = capture_tick_us()
             if action is not None:
-                portal.send_state(arm_q=action.arm_q, hand_q=action.hand_q, fsm_id=action.fsm_id)
+                portal.send_state(
+                    arm_q=action.arm_q, hand_q=action.hand_q, fsm_id=action.fsm_id,
+                    timestamp_us=tick_us)
             else:
-                portal.send_state(fsm_id=0)
+                portal.send_state(fsm_id=0, timestamp_us=tick_us)
             if track:
                 rgb = _test_pattern(480, 640, now - t0)
-                portal.send_video_frame(track, rgb, timestamp_us=int(now * 1_000_000))
+                portal.send_video_frame(track, rgb, timestamp_us=tick_us)
             if now - last_log >= 1.0:
                 rate = n - last_count
                 last_count = n

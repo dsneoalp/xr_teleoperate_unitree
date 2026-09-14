@@ -29,6 +29,8 @@ class UnpackedAction:
     vy: float
     vyaw: float
     fsm_id: int
+    timestamp_us: int | None = None
+    in_reply_to_ts_us: int | None = None
 
 
 class PortalMapping:
@@ -117,7 +119,7 @@ class PortalMapping:
                 values[name] = 0.0
         return values
 
-    def unpack_action(self, values: dict) -> UnpackedAction:
+    def unpack_action(self, values: dict, timestamp_us=None, in_reply_to_ts_us=None) -> UnpackedAction:
         raw = values or {}
         arm_q = np.zeros(self.arm_dof, dtype=np.float64)
         hand_q = np.zeros(self.hand_dof, dtype=np.float64)
@@ -139,6 +141,8 @@ class PortalMapping:
             vy=loco[1],
             vyaw=loco[2],
             fsm_id=int(fsm_raw or 0),
+            timestamp_us=timestamp_us,
+            in_reply_to_ts_us=in_reply_to_ts_us,
         )
 
     def unpack_arm_q(self, state: dict):

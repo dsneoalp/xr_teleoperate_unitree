@@ -109,7 +109,11 @@ class PortalRobotTransport:
 
     def _on_action(self, action) -> None:
         raw = getattr(action, "raw_values", None) or getattr(action, "values", None) or {}
-        unpacked = self.mapping.unpack_action(raw)
+        unpacked = self.mapping.unpack_action(
+            raw,
+            timestamp_us=getattr(action, "timestamp_us", None),
+            in_reply_to_ts_us=getattr(action, "in_reply_to_ts_us", None),
+        )
         cb = self._action_cb
         if cb is not None:
             try:

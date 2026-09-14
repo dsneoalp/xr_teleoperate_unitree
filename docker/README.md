@@ -27,6 +27,31 @@ Operator default command: `--arm G1_29 --ee dex3 --input-mode hand`.
 
 `teleop/` is bind-mounted into every service (`assets/` into operator). `.py` / YAML edits apply on container restart. New pip dependencies or Dockerfile changes still need a rebuild.
 
+## Portal sync and recording
+
+Robot and operator share [`teleop/portal.yaml`](../teleop/portal.yaml) (`fps: 30`, `slack: 2`). Each robot tick stamps **state and video with the same `timestamp_us`** (Portal unified sampling). The video thread holds one latest frame only (drop-oldest); there is no action/state queue between Operator and Robot.
+
+Live XR uses unmatched `on_video_frame` (lowest latency). Recordings (`--record`, toggle `s`) join Portal-matched observations with the action that has `in_reply_to_ts_us == obs.timestamp_us` (`action_subscription` on the operator). Target rate is 30 Hz; a rolling window below 20 Hz is logged as an error (`--record-min-hz`).
+
+## Tests
+
+On the host, from the repo root (conda env `tv`):
+
+```bash
+conda run -n tv python -m pytest tests/
+# unittest fallback:
+conda run -n tv python -m unittest discover -s tests -v
+```
+
+In the operator image:
+
+```bash
+docker compose -f docker/compose.yml run --rm --no-deps --entrypoint python -w /app \
+  operator -m unittest discover -s tests -v
+```
+
+See [`tests/Test_ReadMe.md`](../tests/Test_ReadMe.md). LiveKit round-trip tests skip unless `teleop/.env` has `LIVEKIT_URL`.
+
 ## Build / run
 
 ```bash

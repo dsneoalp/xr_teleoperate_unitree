@@ -26,6 +26,12 @@ from teleop.robot_control.portal_robot import PortalRobotTransport
 from teleop.robot_control.portal_mapping import UnpackedAction
 from teleop.utils.loop_timing import LoopTiming
 from teleop.utils.arm_stiffness import ARM_STIFFNESS_FADE_S
+from teleop.utils.portal_sync import (
+    LatestStampedSlot,
+    StampedVideo,
+    capture_tick_us,
+    grab_head_rgb,
+)
 
 FSM_IDLE = 0
 FSM_TELEOP = 1
@@ -91,27 +97,26 @@ def _connect_image_client(host: str):
     return None
 
 
-def _video_publish_loop(img_client, portal, track, stop_evt, fps: float):
-    """Grab latest ZMQ frame and publish off the control loop. Drop-oldest: no queue."""
+def _video_publish_loop(slot: LatestStampedSlot, portal, stop_evt):
+    """Publish the latest stamped RGB frame. Drop-oldest: the slot holds one item."""
     logged = False
-    interval = 1.0 / max(fps, 1.0)
     while not stop_evt.is_set():
-        t0 = time.time()
+        item = slot.take()
+        if item is None:
+            if stop_evt.wait(0.001):
+                break
+            continue
         try:
-            head = img_client.get_head_frame()
-            if head is not None and getattr(head, "bgr", None) is not None:
-                rgb = np.ascontiguousarray(head.bgr[:, :, ::-1])
-                portal.send_video_frame(
-                    track, rgb, timestamp_us=int(time.time() * 1_000_000))
-                if not logged:
-                    h, w = rgb.shape[:2]
-                    logger_mp.info(f"publishing '{track}' {w}x{h} (video thread)")
-                    logged = True
+            portal.send_video_frame(item.track, item.rgb, timestamp_us=item.timestamp_us)
+            if not logged:
+                height, width = item.rgb.shape[:2]
+                logger_mp.info(
+                    f"publishing '{item.track}' {width}x{height} "
+                    f"(unified timestamp_us={item.timestamp_us})"
+                )
+                logged = True
         except Exception as exc:
             logger_mp.warning(f"video thread: {exc}")
-        sleep = interval - (time.time() - t0)
-        if sleep > 0:
-            stop_evt.wait(sleep)
 
 
 if __name__ == '__main__':
@@ -171,14 +176,15 @@ if __name__ == '__main__':
     img_client = None if args.no_img else _connect_image_client(args.img_server_ip)
     video_track = portal.video_tracks[0] if portal.video_tracks else None
     video_stop = threading.Event()
+    video_slot = LatestStampedSlot()
     video_thread = None
     if img_client is not None and video_track:
         video_thread = threading.Thread(
             target=_video_publish_loop,
-            args=(img_client, portal, video_track, video_stop, args.frequency),
+            args=(video_slot, portal, video_stop),
             daemon=True)
         video_thread.start()
-        logger_mp.info("video publish thread started")
+        logger_mp.info("video publish thread started (unified capture timestamps)")
 
     lock = threading.Lock()
     latest = {'action': None, 'wall': 0.0}
@@ -287,7 +293,14 @@ if __name__ == '__main__':
 
             motor_q = arm_ctrl.get_current_motor_q()
             hand_q = hand_ctrl.get_current_dual_hand_q() if hand_ctrl is not None else None
-            portal.send_state(motor_q=motor_q, hand_q=hand_q, fsm_id=fsm)
+            tick_us = capture_tick_us()
+            if img_client is not None and video_track:
+                rgb = grab_head_rgb(img_client)
+                if rgb is not None:
+                    video_slot.put(StampedVideo(
+                        track=video_track, rgb=rgb, timestamp_us=tick_us))
+            portal.send_state(
+                motor_q=motor_q, hand_q=hand_q, fsm_id=fsm, timestamp_us=tick_us)
 
             sleep = max(0.0, (1.0 / args.frequency) - (time.time() - start))
             time.sleep(sleep)

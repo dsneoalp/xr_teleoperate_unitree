@@ -4,10 +4,14 @@ Used by teleop_operator.py (not as arm_ctrl):
 
   * IK arm targets, dex3 retargeting, and loco (vx/vy/vyaw) are published
     as Portal actions at the teleop control rate.
-  * Robot state is received via on_observation (joints only; video is
-    decoded on on_video_frame). IK warm-starts from last sent targets so
-    delayed WAN state does not oscillate the solver. Missing state still
+  * Robot state is received via on_observation. Portal fuses video into
+    obs.frames when every track matches the state timestamp. Live XR still
+    uses on_video_frame (latest unmatched frame) so display is not delayed
+    by the match window. IK warm-starts from last sent targets so delayed
+    WAN state does not oscillate the solver. Missing state still
     dead-reckons with those targets.
+  * Recordings consume matched obs.frames plus on_action (action_subscription)
+    joined on in_reply_to_ts_us.
   * Video: every track listed under portal.yaml `videos:` is subscribed.
     TeleVuer / get_head_frame() shows the first entry; extra tracks map
     to left/right wrist in declaration order.
@@ -37,6 +41,7 @@ if parent2_dir not in sys.path:
     sys.path.append(parent2_dir)
 
 from teleop.robot_control.portal_mapping import PortalMapping
+from teleop.utils.portal_recording import MatchedObservation
 
 # ImageClient / TeleVuer slot names. Portal tracks bind by yaml order.
 _TELEVUER_SLOTS = ("head_camera", "left_wrist_camera", "right_wrist_camera")
@@ -176,9 +181,16 @@ class PortalTeleopBridge:
                 self._expected_hw[cam] = (int(shape[0]), int(shape[1]))
 
         cfg = OperatorConfig.from_yaml_file(portal_yaml, self._room)
+        if hasattr(cfg, "set_action_subscription"):
+            cfg.set_action_subscription(True)
         self._op = Operator(cfg)
         self._op.on_observation(self._on_observation)
-        self._op.on_drop(lambda drops: logger_mp.debug(f"[portal] dropped states: {len(drops)}"))
+        self._op.on_drop(self._on_drop)
+        if hasattr(self._op, "on_action"):
+            self._op.on_action(self._on_subscribed_action)
+        else:
+            logger_mp.warning(
+                "[portal] Operator has no on_action; recordings cannot join actions")
         for track in self._declared_videos:
             self._op.on_video_frame(track, self._on_video_frame)
         self._frames_logged = set()
@@ -196,6 +208,11 @@ class PortalTeleopBridge:
         self._frames = {}
         self._pending_action_wall = None
         self._rtt_cb = None
+        self._obs_tick_cb = None
+        self._drop_cb = None
+        self._record_obs_cb = None
+        self._record_action_cb = None
+        self._recording_enabled = False
 
         self._arm_lock = threading.Lock()
         self._q_target = np.zeros(arm_dof)
@@ -270,6 +287,14 @@ class PortalTeleopBridge:
             msg = self._connect_error or "timeout"
             raise RuntimeError(f"[portal] operator failed to connect: {msg}")
 
+    def _on_drop(self, drops) -> None:
+        n = len(drops) if drops is not None else 0
+        if n and self._drop_cb is not None:
+            try:
+                self._drop_cb(n)
+            except Exception as exc:
+                logger_mp.debug(f"[portal] drop callback failed: {exc}")
+
     def _on_observation(self, obs) -> None:
         ts_us = getattr(obs, "timestamp_us", None)
         wall = time.time()
@@ -296,6 +321,11 @@ class PortalTeleopBridge:
                 self._rtt_cb(rtt_ms)
             except Exception as exc:
                 logger_mp.debug(f"[portal] rtt callback failed: {exc}")
+        if self._obs_tick_cb is not None:
+            try:
+                self._obs_tick_cb()
+            except Exception as exc:
+                logger_mp.debug(f"[portal] obs tick callback failed: {exc}")
 
         if (hand_new is not None
                 and self._dual_hand_state_array_out is not None
@@ -303,6 +333,40 @@ class PortalTeleopBridge:
             with self._dual_hand_data_lock:
                 n = min(len(self._dual_hand_state_array_out), hand_new.size)
                 self._dual_hand_state_array_out[:n] = hand_new[:n]
+
+        if self._recording_enabled and self._record_obs_cb is not None and ts_us is not None:
+            frames_bgr = {}
+            obs_frames = getattr(obs, "frames", None) or {}
+            for track, frame in obs_frames.items():
+                decoded = self._decode_video_frame(track, frame)
+                for name, wrapped in decoded.items():
+                    if wrapped.bgr is not None:
+                        frames_bgr[name] = wrapped.bgr
+            fsm_raw = raw.get(self._map.fsm, 0) if raw else 0
+            try:
+                self._record_obs_cb(MatchedObservation(
+                    timestamp_us=int(ts_us),
+                    frames_bgr=frames_bgr,
+                    arm_q=q_new,
+                    hand_q=hand_new,
+                    fsm_id=int(fsm_raw or 0),
+                ))
+            except Exception as exc:
+                logger_mp.debug(f"[portal] record observation callback failed: {exc}")
+
+    def _on_subscribed_action(self, action) -> None:
+        if not self._recording_enabled or self._record_action_cb is None:
+            return
+        raw = getattr(action, "raw_values", None) or getattr(action, "values", None) or {}
+        unpacked = self._map.unpack_action(
+            raw,
+            timestamp_us=getattr(action, "timestamp_us", None),
+            in_reply_to_ts_us=getattr(action, "in_reply_to_ts_us", None),
+        )
+        try:
+            self._record_action_cb(unpacked)
+        except Exception as exc:
+            logger_mp.debug(f"[portal] record action callback failed: {exc}")
 
     def _on_video_frame(self, track: str, frame) -> None:
         stored = self._decode_video_frame(track, frame)
@@ -407,6 +471,29 @@ class PortalTeleopBridge:
     def on_rtt(self, callback) -> None:
         """callback(rtt_ms) on the first observation after a successful send_action."""
         self._rtt_cb = callback
+
+    def on_observation_tick(self, callback) -> None:
+        """callback() once per Portal observation (matched or joints-only)."""
+        self._obs_tick_cb = callback
+
+    def on_state_drop(self, callback) -> None:
+        """callback(n) when Portal drops n unmatched states."""
+        self._drop_cb = callback
+
+    def on_matched_observation(self, callback) -> None:
+        """callback(MatchedObservation) while recording is enabled."""
+        self._record_obs_cb = callback
+
+    def on_subscribed_action(self, callback) -> None:
+        """callback(UnpackedAction) from Portal action_subscription / self-echo."""
+        self._record_action_cb = callback
+
+    def set_recording_enabled(self, enabled: bool) -> None:
+        self._recording_enabled = bool(enabled)
+
+    @property
+    def declared_videos(self) -> list:
+        return list(self._declared_videos)
 
     def state_age_ms(self) -> float | None:
         with self._obs_lock:

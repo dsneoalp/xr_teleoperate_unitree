@@ -60,5 +60,11 @@ class LoopTiming:
         if den:
             hz = den / elapsed if elapsed > 0 else 0.0
             parts.append(f"stale_frac={num / den:.2f} hz={hz:.1f}")
+        for name in ("obs", "record", "drop", "join_miss"):
+            if name not in counts:
+                continue
+            n = counts[name]
+            hz = n / elapsed if elapsed > 0 else 0.0
+            parts.append(f"{name}={n} hz={hz:.1f}")
         if parts:
             self._log.info(f"{self._prefix} " + " | ".join(parts))
